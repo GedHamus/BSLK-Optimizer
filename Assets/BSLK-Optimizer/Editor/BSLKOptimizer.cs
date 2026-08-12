@@ -893,7 +893,7 @@ namespace BSLK.Optimizer
                 { TextureImporterFormat.ARGB32, TextureImporterFormat.RGB24 },
                 { TextureImporterFormat.DXT5, TextureImporterFormat.DXT1 },
                 { TextureImporterFormat.DXT5Crunched, TextureImporterFormat.DXT1Crunched },
-                { TextureImporterFormat.ATC_RGBA8, TextureImporterFormat.ATC_RGB4 },
+                { TextureImporterFormat.ETC2_RGBA8, TextureImporterFormat.ETC_RGB4 },
                 { TextureImporterFormat.PVRTC_RGBA2, TextureImporterFormat.PVRTC_RGB2 },
                 { TextureImporterFormat.PVRTC_RGBA4, TextureImporterFormat.PVRTC_RGB4 }
             };

@@ -46,7 +46,7 @@ namespace BSLK.Optimizer
         private Vector2 togglesScroll;
         private string report = "";
 
-        [MenuItem("Tools/BSLK-Optimizer")]
+        [MenuItem("BSLK-Optimizer/BSLK-Optimizer")]
         private static void Open()
         {
             BSLKOptimizerWindow window = GetWindow<BSLKOptimizerWindow>("BSLK-Optimizer");
