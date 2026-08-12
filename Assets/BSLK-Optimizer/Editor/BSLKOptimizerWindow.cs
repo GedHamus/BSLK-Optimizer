@@ -102,12 +102,12 @@ namespace BSLK.Optimizer
             GUILayout.Space(12);
 
             avatar = (GameObject)EditorGUILayout.ObjectField(
-                new GUIContent("Аватар", "Перетащите аватар, чтобы обработать его копию. Пусто = вся открытая сцена."),
+                new GUIContent("Аватар", "Перетащите аватар, чтобы обработать его. Пусто = вся открытая сцена."),
                 avatar,
                 typeof(GameObject),
                 true);
             if (avatar != null)
-                EditorGUILayout.HelpBox("Будет создана копия " + avatar.name + " BSLK-Optimized, оригинал не изменится.", MessageType.Info);
+                EditorGUILayout.HelpBox("Изменения будут применены к «" + avatar.name + "» напрямую, без копий.", MessageType.Info);
             else
                 EditorGUILayout.HelpBox("Аватар не указан — обработаются вся открытая сцена и все текстуры проекта.", MessageType.Warning);
 
@@ -246,14 +246,6 @@ namespace BSLK.Optimizer
                 EditorUtility.DisplayDialog("BSLK-Optimizer", reportText, "OK");
                 Debug.Log("[BSLK-Optimizer]\n" + reportText);
                 return;
-            }
-
-            if (avatar != null)
-            {
-                string avatarNameBefore = avatar.name;
-                avatar = BSLKOptimizer.PrepareAvatarCopy(avatar);
-                if (avatar.name != avatarNameBefore)
-                    report += "Создана копия аватара: " + avatar.name + " — все изменения применены к ней, оригинал не тронут\n";
             }
 
             if (deleteDisabledObjects)
