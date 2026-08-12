@@ -21,6 +21,7 @@ namespace BSLK.Optimizer
         private const string PrefConvertRgbNoAlpha = "BSLK.Optimizer.ConvertRgbNoAlpha";
         private const string PrefDisableTextureReadWrite = "BSLK.Optimizer.DisableTextureReadWrite";
         private const string PrefRepo = "BSLK.Optimizer.Repo";
+        private const string DefaultRepo = "GedHamus/BSLK-Optimizer";
 
         private GameObject avatar;
         private bool deleteDisabledObjects = true;
@@ -71,7 +72,7 @@ namespace BSLK.Optimizer
             removeMissingScripts = EditorPrefs.GetBool(PrefRemoveMissingScripts, true);
             convertRgbNoAlpha = EditorPrefs.GetBool(PrefConvertRgbNoAlpha, true);
             disableTextureReadWrite = EditorPrefs.GetBool(PrefDisableTextureReadWrite, true);
-            repo = EditorPrefs.GetString(PrefRepo, "");
+            repo = EditorPrefs.GetString(PrefRepo, DefaultRepo);
         }
 
         private void OnDisable()
