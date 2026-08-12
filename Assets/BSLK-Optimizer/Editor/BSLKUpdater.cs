@@ -96,7 +96,7 @@ namespace BSLK.Optimizer
         {
             if (index >= UpdateFiles.Length)
             {
-                WriteFiles(contents);
+                WriteFiles(contents, tag);
                 return;
             }
 
@@ -125,8 +125,10 @@ namespace BSLK.Optimizer
             };
         }
 
-        private static void WriteFiles(string[] contents)
+        private static void WriteFiles(string[] contents, string tag)
         {
+            string version = tag.TrimStart('v', 'V');
+
             for (int i = 0; i < UpdateFiles.Length; i++)
             {
                 string relative = UpdateFiles[i];
@@ -136,14 +138,31 @@ namespace BSLK.Optimizer
                     if (!System.IO.File.Exists(backup))
                         System.IO.File.Copy(relative, backup);
                 }
-                System.IO.File.WriteAllText(relative, contents[i]);
+
+                string content = PatchVersionInContent(contents[i], version);
+                System.IO.File.WriteAllText(relative, content);
             }
 
             EditorUtility.DisplayDialog(
                 "BSLK-Optimizer",
-                "Обновление установлено. Редактор перекомпилируется...",
+                "Обновление до версии " + version + " установлено. Редактор перекомпилируется...",
                 "OK");
             AssetDatabase.Refresh();
+        }
+
+        private static string PatchVersionInContent(string content, string version)
+        {
+            const string marker = "public const string Version = \"";
+            int start = content.IndexOf(marker);
+            if (start < 0)
+                return content;
+
+            int valueStart = start + marker.Length;
+            int valueEnd = content.IndexOf('"', valueStart);
+            if (valueEnd < 0)
+                return content;
+
+            return content.Substring(0, valueStart) + version + content.Substring(valueEnd);
         }
 
         public static int CompareVersions(string a, string b)

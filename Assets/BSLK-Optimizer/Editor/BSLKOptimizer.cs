@@ -10,7 +10,7 @@ namespace BSLK.Optimizer
     {
         public const int MaxTextureSize = 2048;
 
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.1";
 
         private static readonly string[] PlatformNames =
         {
