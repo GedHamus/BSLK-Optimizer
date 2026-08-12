@@ -20,8 +20,7 @@ namespace BSLK.Optimizer
         private const string PrefRemoveMissingScripts = "BSLK.Optimizer.RemoveMissingScripts";
         private const string PrefConvertRgbNoAlpha = "BSLK.Optimizer.ConvertRgbNoAlpha";
         private const string PrefDisableTextureReadWrite = "BSLK.Optimizer.DisableTextureReadWrite";
-        private const string PrefRepo = "BSLK.Optimizer.Repo";
-        private const string DefaultRepo = "GedHamus/BSLK-Optimizer";
+        private const string Repo = "GedHamus/BSLK-Optimizer";
 
         private GameObject avatar;
         private bool deleteDisabledObjects = true;
@@ -40,7 +39,6 @@ namespace BSLK.Optimizer
         private bool convertRgbNoAlpha = true;
         private bool disableTextureReadWrite = true;
 
-        private string repo = "";
         private string updateStatus = "";
         private bool updating;
 
@@ -72,7 +70,6 @@ namespace BSLK.Optimizer
             removeMissingScripts = EditorPrefs.GetBool(PrefRemoveMissingScripts, true);
             convertRgbNoAlpha = EditorPrefs.GetBool(PrefConvertRgbNoAlpha, true);
             disableTextureReadWrite = EditorPrefs.GetBool(PrefDisableTextureReadWrite, true);
-            repo = EditorPrefs.GetString(PrefRepo, DefaultRepo);
         }
 
         private void OnDisable()
@@ -92,7 +89,6 @@ namespace BSLK.Optimizer
             EditorPrefs.SetBool(PrefRemoveMissingScripts, removeMissingScripts);
             EditorPrefs.SetBool(PrefConvertRgbNoAlpha, convertRgbNoAlpha);
             EditorPrefs.SetBool(PrefDisableTextureReadWrite, disableTextureReadWrite);
-            EditorPrefs.SetString(PrefRepo, repo);
         }
 
         private void OnGUI()
@@ -195,10 +191,9 @@ namespace BSLK.Optimizer
             GUILayout.Space(10);
 
             EditorGUILayout.LabelField("Обновление", EditorStyles.boldLabel);
-            repo = EditorGUILayout.TextField("Репозиторий (owner/repo)", repo);
             GUILayout.BeginHorizontal();
             GUILayout.Label("Версия: " + BSLKOptimizer.Version, GUILayout.ExpandWidth(true));
-            GUI.enabled = !string.IsNullOrEmpty(repo) && !updating;
+            GUI.enabled = !updating;
             if (GUILayout.Button("Проверить обновления", GUILayout.Width(150)))
                 CheckUpdates();
             GUI.enabled = true;
@@ -221,7 +216,7 @@ namespace BSLK.Optimizer
         {
             updating = true;
             updateStatus = "Проверка обновлений...";
-            BSLKUpdater.CheckForUpdates(repo, status =>
+            BSLKUpdater.CheckForUpdates(Repo, status =>
             {
                 updating = false;
                 updateStatus = status;
