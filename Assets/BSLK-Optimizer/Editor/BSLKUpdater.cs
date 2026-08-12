@@ -96,7 +96,7 @@ namespace BSLK.Optimizer
         {
             if (index >= UpdateFiles.Length)
             {
-                WriteFiles(contents, tag);
+                WriteFiles(contents, tag, onStatus);
                 return;
             }
 
@@ -125,7 +125,7 @@ namespace BSLK.Optimizer
             };
         }
 
-        private static void WriteFiles(string[] contents, string tag)
+        private static void WriteFiles(string[] contents, string tag, Action<string> onStatus)
         {
             string version = tag.TrimStart('v', 'V');
 
@@ -147,6 +147,7 @@ namespace BSLK.Optimizer
                 "BSLK-Optimizer",
                 "Обновление до версии " + version + " установлено. Редактор перекомпилируется...",
                 "OK");
+            onStatus("Установлена версия " + version + ".");
             AssetDatabase.Refresh();
         }
 
