@@ -1028,7 +1028,9 @@ namespace BSLK.Optimizer
 
             if (avatar != null)
             {
-                targets.AddRange(avatar.GetComponentsInChildren<GameObject>(true));
+                Transform[] all = avatar.GetComponentsInChildren<Transform>(true);
+                for (int i = 0; i < all.Length; i++)
+                    targets.Add(all[i].gameObject);
             }
             else
             {
@@ -1041,7 +1043,11 @@ namespace BSLK.Optimizer
 
                 GameObject[] roots = scene.GetRootGameObjects();
                 for (int i = 0; i < roots.Length; i++)
-                    targets.AddRange(roots[i].GetComponentsInChildren<GameObject>(true));
+                {
+                    Transform[] all = roots[i].GetComponentsInChildren<Transform>(true);
+                    for (int t = 0; t < all.Length; t++)
+                        targets.Add(all[t].gameObject);
+                }
             }
 
             int removed = 0;
