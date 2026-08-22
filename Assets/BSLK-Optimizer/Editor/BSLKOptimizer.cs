@@ -10,7 +10,7 @@ namespace BSLK.Optimizer
     {
         public const int MaxTextureSize = 2048;
 
-        public const string Version = "1.1.1";
+        public const string Version = "1.1.2";
 
         private static readonly string[] PlatformNames =
         {
@@ -202,20 +202,51 @@ namespace BSLK.Optimizer
             return probes.Count;
         }
 
-        private static bool IsMeshOperationAlreadyDone(GameObject avatar)
+        private static Mesh EnsureMutableMesh(GameObject avatar, Mesh mesh, Dictionary<Mesh, Mesh> cloneMap, List<Renderer> allRenderers)
         {
-            if (avatar == null)
-                return false;
-            return EditorPrefs.GetBool("BSLK.Optimized_" + avatar.GetInstanceID(), false);
+            if (mesh == null)
+                return null;
+            if (cloneMap.TryGetValue(mesh, out Mesh existingClone))
+                return existingClone;
+
+            string path = AssetDatabase.GetAssetPath(mesh);
+            bool isAsset = !string.IsNullOrEmpty(path);
+            // Клонируем только ассеты из проекта (FBX), чтобы не портить исходный файл.
+            // Меши уже в сцене (path=="") — уже инстансы, клонировать не нужно.
+            if (!isAsset)
+                return mesh;
+
+            Mesh clone = UnityEngine.Object.Instantiate(mesh);
+            clone.name = mesh.name;
+            cloneMap[mesh] = clone;
+
+            // Переназначить всем рендерерам, которые шарили этот меш
+            for (int i = 0; i < allRenderers.Count; i++)
+            {
+                if (allRenderers[i] == null)
+                    continue;
+                SkinnedMeshRenderer smr = allRenderers[i] as SkinnedMeshRenderer;
+                if (smr != null && smr.sharedMesh == mesh)
+                {
+                    Undo.RecordObject(smr, "BSLK-Optimizer: клонирование меша");
+                    smr.sharedMesh = clone;
+                    EditorUtility.SetDirty(smr);
+                    continue;
+                }
+                MeshFilter mf = allRenderers[i].GetComponent<MeshFilter>();
+                if (mf != null && mf.sharedMesh == mesh)
+                {
+                    Undo.RecordObject(mf, "BSLK-Optimizer: клонирование меша");
+                    mf.sharedMesh = clone;
+                    EditorUtility.SetDirty(mf);
+                }
+            }
+            // Если меш шарится вне аватара (редкий кейс) — тоже клонируем, но не переназначаем
+            return clone;
         }
 
         public static int RemoveEmptyMaterialSlots(GameObject avatar)
         {
-            if (IsMeshOperationAlreadyDone(avatar))
-            {
-                Debug.Log("[BSLK-Optimizer] Пропущено удаление пустых слотов — аватар уже оптимизирован (защита от повторной порчи меша).");
-                return 0;
-            }
 
             List<Renderer> renderers = new List<Renderer>();
             if (!TryCollectRenderers(avatar, renderers))
@@ -368,12 +399,6 @@ namespace BSLK.Optimizer
 
         public static BlendShapeReport RemoveUnusedBlendShapes(GameObject avatar)
         {
-            if (IsMeshOperationAlreadyDone(avatar))
-            {
-                Debug.Log("[BSLK-Optimizer] Пропущено удаление BlendShapes — аватар уже оптимизирован (защита от повторной порчи меша).");
-                return new BlendShapeReport();
-            }
-
             BlendShapeReport report = new BlendShapeReport();
 
             List<SkinnedMeshRenderer> renderers = new List<SkinnedMeshRenderer>();
@@ -390,6 +415,11 @@ namespace BSLK.Optimizer
             HashSet<string> usedShapes = CollectUsedBlendShapeNames();
 
             List<Mesh> meshList = new List<Mesh>(meshes);
+
+            // Для клонирования нужен полный список рендереров аватара
+            List<Renderer> allRenderers = new List<Renderer>();
+            TryCollectRenderers(avatar, allRenderers);
+            Dictionary<Mesh, Mesh> cloneMap = new Dictionary<Mesh, Mesh>();
             for (int i = 0; i < meshList.Count; i++)
             {
                 if (EditorUtility.DisplayCancelableProgressBar(
@@ -405,6 +435,8 @@ namespace BSLK.Optimizer
                     Debug.LogWarning("[BSLK-Optimizer] Меш «" + mesh.name + "» не доступен для чтения, Blend Shapes не удалены.");
                     continue;
                 }
+
+                mesh = EnsureMutableMesh(avatar, mesh, cloneMap, allRenderers);
 
                 int shapeCount = mesh.blendShapeCount;
                 int removeCount = 0;
@@ -510,12 +542,6 @@ namespace BSLK.Optimizer
 
         public static MeshReport OptimizeMeshes(GameObject avatar)
         {
-            if (IsMeshOperationAlreadyDone(avatar))
-            {
-                Debug.Log("[BSLK-Optimizer] Пропущено OptimizeMeshes — аватар уже оптимизирован (защита от повторной порчи меша).");
-                return new MeshReport();
-            }
-
             MeshReport report = new MeshReport();
 
             List<Renderer> renderers = new List<Renderer>();
@@ -549,6 +575,7 @@ namespace BSLK.Optimizer
                     skinnedMeshes.Add(smr.sharedMesh);
             }
 
+            Dictionary<Mesh, Mesh> cloneMap = new Dictionary<Mesh, Mesh>();
             for (int i = 0; i < meshList.Count; i++)
             {
                 if (EditorUtility.DisplayCancelableProgressBar(
@@ -586,6 +613,7 @@ namespace BSLK.Optimizer
 
                 try
                 {
+                    mesh = EnsureMutableMesh(avatar, mesh, cloneMap, renderers);
                     mesh.Optimize();
                     try { mesh.RecalculateBounds(); } catch { }
                     EditorUtility.SetDirty(mesh);
@@ -604,18 +632,15 @@ namespace BSLK.Optimizer
 
         public static BoneReport RemoveUnusedBones(GameObject avatar)
         {
-            if (IsMeshOperationAlreadyDone(avatar))
-            {
-                Debug.Log("[BSLK-Optimizer] Пропущено удаление костей — аватар уже оптимизирован (защита от повторной порчи меша).");
-                return new BoneReport();
-            }
-
             BoneReport report = new BoneReport();
 
             List<SkinnedMeshRenderer> renderers = new List<SkinnedMeshRenderer>();
             if (!TryCollectSkinnedRenderers(avatar, renderers))
                 return report;
 
+            List<Renderer> allRenderers = new List<Renderer>();
+            TryCollectRenderers(avatar, allRenderers);
+            Dictionary<Mesh, Mesh> cloneMap = new Dictionary<Mesh, Mesh>();
             Dictionary<Mesh, Transform[]> processedBones = new Dictionary<Mesh, Transform[]>();
 
             for (int i = 0; i < renderers.Count; i++)
@@ -684,6 +709,9 @@ namespace BSLK.Optimizer
                 if (!hasUnused)
                     continue;
 
+                Mesh originalMesh = mesh;
+                mesh = EnsureMutableMesh(avatar, mesh, cloneMap, allRenderers);
+
                 int[] remap = new int[used.Length];
                 List<Transform> newBones = new List<Transform>();
                 List<Matrix4x4> newBindposes = new List<Matrix4x4>();
@@ -731,7 +759,9 @@ namespace BSLK.Optimizer
                 Transform[] newBonesArray = newBones.ToArray();
                 mesh.bindposes = newBindposes.ToArray();
                 renderer.bones = newBonesArray;
-                processedBones[mesh] = newBonesArray;
+                processedBones[originalMesh] = newBonesArray;
+                if (originalMesh != mesh)
+                    processedBones[mesh] = newBonesArray;
 
                 int rootIdx = renderer.rootBone != null ? FindBoneIndex(renderer.rootBone, bones) : -1;
                 if (rootIdx >= 0 && !used[rootIdx])
