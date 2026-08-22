@@ -238,6 +238,22 @@ namespace BSLK.Optimizer
                         newMaterials[w++] = materials[m];
                 }
 
+                Mesh mesh = null;
+                SkinnedMeshRenderer skinned = renderers[i] as SkinnedMeshRenderer;
+                if (skinned != null)
+                    mesh = skinned.sharedMesh;
+                else
+                {
+                    MeshFilter filter = renderers[i].GetComponent<MeshFilter>();
+                    if (filter != null)
+                        mesh = filter.sharedMesh;
+                }
+                if (mesh != null && newMaterials.Length < mesh.subMeshCount)
+                {
+                    Debug.LogWarning("[BSLK-Optimizer] Рендерер «" + renderers[i].name + "»: после удаления пустых слотов материалов (" + newMaterials.Length + ") меньше чем subMeshCount (" + mesh.subMeshCount + "), пропущен чтобы не сломать меш.");
+                    continue;
+                }
+
                 Undo.RecordObject(renderers[i], "BSLK-Optimizer: удаление пустых слотов материалов");
                 renderers[i].sharedMaterials = newMaterials;
                 cleaned += nullCount;
@@ -498,6 +514,15 @@ namespace BSLK.Optimizer
             List<Mesh> meshList = new List<Mesh>(meshes);
             report.meshes = meshList.Count;
 
+            // Собираем все скинед-меши чтобы не ломать скиннинг на втором клике
+            HashSet<Mesh> skinnedMeshes = new HashSet<Mesh>();
+            for (int i = 0; i < renderers.Count; i++)
+            {
+                SkinnedMeshRenderer smr = renderers[i] as SkinnedMeshRenderer;
+                if (smr != null && smr.sharedMesh != null)
+                    skinnedMeshes.Add(smr.sharedMesh);
+            }
+
             for (int i = 0; i < meshList.Count; i++)
             {
                 if (EditorUtility.DisplayCancelableProgressBar(
@@ -506,16 +531,43 @@ namespace BSLK.Optimizer
                         (float)(i + 1) / meshList.Count))
                     break;
 
+                Mesh mesh = meshList[i];
+                if (mesh == null)
+                {
+                    report.skipped++;
+                    continue;
+                }
+                if (skinnedMeshes.Contains(mesh))
+                {
+                    report.skipped++;
+                    continue;
+                }
+                if (!mesh.isReadable)
+                {
+                    report.skipped++;
+                    continue;
+                }
+                if (mesh.blendShapeCount > 0)
+                {
+                    report.skipped++;
+                    continue;
+                }
+                if (mesh.boneWeights != null && mesh.boneWeights.Length > 0)
+                {
+                    report.skipped++;
+                    continue;
+                }
+
                 try
                 {
-                    meshList[i].Optimize();
-                    EditorUtility.SetDirty(meshList[i]);
+                    mesh.Optimize();
+                    EditorUtility.SetDirty(mesh);
                     report.optimized++;
                 }
                 catch (System.Exception e)
                 {
                     report.skipped++;
-                    Debug.LogWarning("[BSLK-Optimizer] Не удалось оптимизировать меш «" + meshList[i].name + "»: " + e.Message);
+                    Debug.LogWarning("[BSLK-Optimizer] Не удалось оптимизировать меш «" + mesh.name + "»: " + e.Message);
                 }
             }
 
@@ -531,7 +583,7 @@ namespace BSLK.Optimizer
             if (!TryCollectSkinnedRenderers(avatar, renderers))
                 return report;
 
-            HashSet<Mesh> processedMeshes = new HashSet<Mesh>();
+            Dictionary<Mesh, Transform[]> processedBones = new Dictionary<Mesh, Transform[]>();
 
             for (int i = 0; i < renderers.Count; i++)
             {
@@ -548,8 +600,18 @@ namespace BSLK.Optimizer
                 if (mesh == null || bones == null || bones.Length == 0)
                     continue;
 
-                if (processedMeshes.Contains(mesh))
+                if (processedBones.TryGetValue(mesh, out Transform[] cachedBones))
+                {
+                    if (renderer.bones.Length != cachedBones.Length)
+                    {
+                        Undo.RecordObject(renderer, "BSLK-Optimizer: удаление неиспользуемых костей");
+                        renderer.bones = cachedBones;
+                        if (renderer.rootBone != null && System.Array.IndexOf(cachedBones, renderer.rootBone) < 0)
+                            renderer.rootBone = cachedBones.Length > 0 ? cachedBones[0] : null;
+                        EditorUtility.SetDirty(renderer);
+                    }
                     continue;
+                }
 
                 if (!mesh.isReadable)
                 {
@@ -564,8 +626,6 @@ namespace BSLK.Optimizer
                     Debug.LogWarning("[BSLK-Optimizer] Меш «" + mesh.name + "»: количество bindposes не совпадает с костями, пропущен.");
                     continue;
                 }
-
-                processedMeshes.Add(mesh);
 
                 bool[] used = CollectUsedBones(mesh, bones.Length);
                 if (used == null)
@@ -616,7 +676,16 @@ namespace BSLK.Optimizer
                 for (int w = 0; w < weights.Length; w++)
                 {
                     BoneWeight1 bw1 = weights[w];
-                    bw1.boneIndex = RemapBoneIndex(bw1.boneIndex, remap);
+                    int orig = bw1.boneIndex;
+                    if (orig >= 0 && orig < remap.Length && remap[orig] == -1)
+                    {
+                        bw1.boneIndex = 0;
+                        bw1.weight = 0f;
+                    }
+                    else
+                    {
+                        bw1.boneIndex = RemapBoneIndex(orig, remap);
+                    }
                     newWeights[w] = bw1;
                 }
 
@@ -626,8 +695,10 @@ namespace BSLK.Optimizer
                 newBonesPerVertex.Dispose();
                 newWeights.Dispose();
 
+                Transform[] newBonesArray = newBones.ToArray();
                 mesh.bindposes = newBindposes.ToArray();
-                renderer.bones = newBones.ToArray();
+                renderer.bones = newBonesArray;
+                processedBones[mesh] = newBonesArray;
 
                 int rootIdx = renderer.rootBone != null ? FindBoneIndex(renderer.rootBone, bones) : -1;
                 if (rootIdx >= 0 && !used[rootIdx])
@@ -758,7 +829,7 @@ namespace BSLK.Optimizer
             if (index < 0 || index >= remap.Length)
                 return index;
             int mapped = remap[index];
-            return mapped >= 0 ? mapped : index;
+            return mapped >= 0 ? mapped : 0;
         }
 
         public static TextureReport ProcessTextures(bool clampSize, bool disableCrunch, GameObject avatar)

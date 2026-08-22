@@ -248,6 +248,34 @@ namespace BSLK.Optimizer
                 return;
             }
 
+            if (avatar != null)
+            {
+                string key = "BSLK.Optimized_" + avatar.GetInstanceID();
+                if (EditorPrefs.GetBool(key, false))
+                {
+                    if (!EditorUtility.DisplayDialog("BSLK-Optimizer",
+                            "Этот аватар уже оптимизировался. Повторный прогон может повторно порезать меши и сломать скиннинг. Продолжить?",
+                            "Продолжить", "Отмена"))
+                        return;
+                }
+                Undo.RegisterCompleteObjectUndo(avatar, "BSLK-Optimizer");
+                // Регистрируем все дочерние трансформы для надёжного Ctrl+Z
+                Transform[] allTransforms = avatar.GetComponentsInChildren<Transform>(true);
+                for (int i = 0; i < allTransforms.Length; i++)
+                    Undo.RegisterCompleteObjectUndo(allTransforms[i].gameObject, "BSLK-Optimizer");
+            }
+            else
+            {
+                // Сцена — регистрируем корни для Undo
+                UnityEngine.SceneManagement.Scene scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+                if (scene.IsValid() && scene.isLoaded)
+                {
+                    GameObject[] roots = scene.GetRootGameObjects();
+                    for (int i = 0; i < roots.Length; i++)
+                        Undo.RegisterCompleteObjectUndo(roots[i], "BSLK-Optimizer");
+                }
+            }
+
             if (deleteDisabledObjects)
             {
                 int removed = BSLKOptimizer.RemoveDisabledObjects(avatar, out int preserved);
@@ -370,6 +398,8 @@ namespace BSLK.Optimizer
             }
 
             AssetDatabase.SaveAssets();
+            if (avatar != null)
+                EditorPrefs.SetBool("BSLK.Optimized_" + avatar.GetInstanceID(), true);
             EditorUtility.DisplayDialog("BSLK-Optimizer", "Оптимизация завершена.\n\n" + report, "OK");
             Debug.Log("[BSLK-Optimizer]\n" + report);
         }
