@@ -10,7 +10,7 @@ namespace BSLK.Optimizer
     {
         public const int MaxTextureSize = 2048;
 
-        public const string Version = "1.1.2";
+        public const string Version = "1.1.3";
 
         private static readonly string[] PlatformNames =
         {
@@ -412,7 +412,14 @@ namespace BSLK.Optimizer
                     meshes.Add(renderers[i].sharedMesh);
             }
 
-            HashSet<string> usedShapes = CollectUsedBlendShapeNames();
+            if (HasVRCComponent(avatar))
+            {
+                Debug.LogWarning("[BSLK-Optimizer] Обнаружен VRC Avatar Descriptor — удаление BlendShapes пропущено, чтобы сохранить viseme/eye blend shapes. Отключи галочку 'Удалить Blend Shapes' если хочешь форсировать.");
+                EditorUtility.ClearProgressBar();
+                return report;
+            }
+
+            HashSet<string> usedShapes = CollectUsedBlendShapeNames(avatar);
 
             List<Mesh> meshList = new List<Mesh>(meshes);
 
@@ -493,9 +500,26 @@ namespace BSLK.Optimizer
             return report;
         }
 
-        private static HashSet<string> CollectUsedBlendShapeNames()
+        private static bool HasVRCComponent(GameObject avatar)
+        {
+            if (avatar == null)
+                return false;
+            Component[] comps = avatar.GetComponentsInChildren<Component>(true);
+            for (int i = 0; i < comps.Length; i++)
+            {
+                if (comps[i] == null)
+                    continue;
+                string tn = comps[i].GetType().Name;
+                if (tn.Contains("VRC") || tn.Contains("VRCAvatarDescriptor") || tn.Contains("PipelineManager"))
+                    return true;
+            }
+            return false;
+        }
+
+        private static HashSet<string> CollectUsedBlendShapeNames(GameObject avatar)
         {
             HashSet<string> names = new HashSet<string>();
+            // 1. Все AnimationClip в проекте
             string[] guids = AssetDatabase.FindAssets("t:AnimationClip");
             for (int i = 0; i < guids.Length; i++)
             {
@@ -513,6 +537,53 @@ namespace BSLK.Optimizer
                     string propertyName = bindings[b].propertyName;
                     if (propertyName.StartsWith("blendShape."))
                         names.Add(propertyName.Substring("blendShape.".Length));
+                }
+            }
+            // 2. Все AnimatorController — их клипы тоже могут содержать бленды, плюс покрывает случаи где клип — саб-ассет
+            string[] ctrlGuids = AssetDatabase.FindAssets("t:AnimatorController");
+            for (int i = 0; i < ctrlGuids.Length; i++)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(ctrlGuids[i]);
+                RuntimeAnimatorController ctrl = AssetDatabase.LoadAssetAtPath<RuntimeAnimatorController>(path);
+                if (ctrl == null)
+                    continue;
+                AnimationClip[] clips = ctrl.animationClips;
+                for (int c = 0; c < clips.Length; c++)
+                {
+                    AnimationClip clip = clips[c];
+                    if (clip == null)
+                        continue;
+                    EditorCurveBinding[] bindings = AnimationUtility.GetCurveBindings(clip);
+                    for (int b = 0; b < bindings.Length; b++)
+                    {
+                        if (bindings[b].type != typeof(SkinnedMeshRenderer))
+                            continue;
+                        string propertyName = bindings[b].propertyName;
+                        if (propertyName.StartsWith("blendShape."))
+                            names.Add(propertyName.Substring("blendShape.".Length));
+                    }
+                }
+            }
+            // 3. Если аватар передан — собрать бленды у которых текущий вес > 0 (пользователь мог выставить в сцене)
+            if (avatar != null)
+            {
+                SkinnedMeshRenderer[] smrs = avatar.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                for (int i = 0; i < smrs.Length; i++)
+                {
+                    SkinnedMeshRenderer smr = smrs[i];
+                    Mesh m = smr.sharedMesh;
+                    if (m == null)
+                        continue;
+                    for (int s = 0; s < m.blendShapeCount; s++)
+                    {
+                        try
+                        {
+                            float w = smr.GetBlendShapeWeight(s);
+                            if (w != 0f)
+                                names.Add(m.GetBlendShapeName(s));
+                        }
+                        catch { }
+                    }
                 }
             }
             return names;
