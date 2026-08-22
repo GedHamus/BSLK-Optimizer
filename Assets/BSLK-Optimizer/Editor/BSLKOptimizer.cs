@@ -202,8 +202,21 @@ namespace BSLK.Optimizer
             return probes.Count;
         }
 
+        private static bool IsMeshOperationAlreadyDone(GameObject avatar)
+        {
+            if (avatar == null)
+                return false;
+            return EditorPrefs.GetBool("BSLK.Optimized_" + avatar.GetInstanceID(), false);
+        }
+
         public static int RemoveEmptyMaterialSlots(GameObject avatar)
         {
+            if (IsMeshOperationAlreadyDone(avatar))
+            {
+                Debug.Log("[BSLK-Optimizer] Пропущено удаление пустых слотов — аватар уже оптимизирован (защита от повторной порчи меша).");
+                return 0;
+            }
+
             List<Renderer> renderers = new List<Renderer>();
             if (!TryCollectRenderers(avatar, renderers))
                 return 0;
@@ -355,6 +368,12 @@ namespace BSLK.Optimizer
 
         public static BlendShapeReport RemoveUnusedBlendShapes(GameObject avatar)
         {
+            if (IsMeshOperationAlreadyDone(avatar))
+            {
+                Debug.Log("[BSLK-Optimizer] Пропущено удаление BlendShapes — аватар уже оптимизирован (защита от повторной порчи меша).");
+                return new BlendShapeReport();
+            }
+
             BlendShapeReport report = new BlendShapeReport();
 
             List<SkinnedMeshRenderer> renderers = new List<SkinnedMeshRenderer>();
@@ -432,6 +451,7 @@ namespace BSLK.Optimizer
                     }
                 }
 
+                try { mesh.RecalculateBounds(); } catch { }
                 EditorUtility.SetDirty(mesh);
                 report.meshes++;
                 report.shapesRemoved += removeCount;
@@ -490,6 +510,12 @@ namespace BSLK.Optimizer
 
         public static MeshReport OptimizeMeshes(GameObject avatar)
         {
+            if (IsMeshOperationAlreadyDone(avatar))
+            {
+                Debug.Log("[BSLK-Optimizer] Пропущено OptimizeMeshes — аватар уже оптимизирован (защита от повторной порчи меша).");
+                return new MeshReport();
+            }
+
             MeshReport report = new MeshReport();
 
             List<Renderer> renderers = new List<Renderer>();
@@ -561,6 +587,7 @@ namespace BSLK.Optimizer
                 try
                 {
                     mesh.Optimize();
+                    try { mesh.RecalculateBounds(); } catch { }
                     EditorUtility.SetDirty(mesh);
                     report.optimized++;
                 }
@@ -577,6 +604,12 @@ namespace BSLK.Optimizer
 
         public static BoneReport RemoveUnusedBones(GameObject avatar)
         {
+            if (IsMeshOperationAlreadyDone(avatar))
+            {
+                Debug.Log("[BSLK-Optimizer] Пропущено удаление костей — аватар уже оптимизирован (защита от повторной порчи меша).");
+                return new BoneReport();
+            }
+
             BoneReport report = new BoneReport();
 
             List<SkinnedMeshRenderer> renderers = new List<SkinnedMeshRenderer>();
@@ -704,7 +737,9 @@ namespace BSLK.Optimizer
                 if (rootIdx >= 0 && !used[rootIdx])
                     renderer.rootBone = newBones.Count > 0 ? newBones[0] : null;
 
+                try { mesh.RecalculateBounds(); } catch { }
                 EditorUtility.SetDirty(mesh);
+                EditorUtility.SetDirty(renderer);
 
                 report.renderers++;
                 report.bonesRemoved += bones.Length - newBones.Count;
