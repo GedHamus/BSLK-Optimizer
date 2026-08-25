@@ -182,10 +182,13 @@ namespace BSLK.Optimizer
                                removeMissingScripts || convertRgbNoAlpha || disableTextureReadWrite ||
                                reportOnly;
 
-            GUI.enabled = anySelected;
+            bool canRun = avatar != null && anySelected;
+            GUI.enabled = canRun;
             string buttonLabel = reportOnly ? "Показать отчёт" : "Оптимизировать";
             if (GUILayout.Button(buttonLabel, GUILayout.Height(36)))
                 RunOptimization();
+            if (avatar == null)
+                EditorGUILayout.HelpBox("Укажите аватар в поле выше, чтобы запустить оптимизацию.", MessageType.Warning);
             GUI.enabled = true;
 
             GUILayout.Space(10);
@@ -226,6 +229,12 @@ namespace BSLK.Optimizer
 
         private void RunOptimization()
         {
+            if (avatar == null)
+            {
+                EditorUtility.DisplayDialog("BSLK-Optimizer", "Укажите аватар в поле «Аватар» — оптимизация без него недоступна.", "OK");
+                return;
+            }
+
             bool anySelected = deleteDisabledObjects || clampTextureSize || disableCrunch || removeUnusedBones ||
                                removeLights || removeCamerasAudio || removeProbes || removeEmptySlots ||
                                optimizeMeshes || removeBlendShapes || removeUnusedTextures ||
