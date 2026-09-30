@@ -16,16 +16,22 @@ namespace BSLK.Optimizer
         private static readonly string[] UpdateFiles =
         {
             "Assets/BSLK-Optimizer/Editor/BSLKOptimizer.cs",
-            "Assets/BSLK-Optimizer/Editor/BSLKOptimizerWindow.cs"
+            "Assets/BSLK-Optimizer/Editor/BSLKOptimizerWindow.cs",
+            "Assets/BSLK-Optimizer/Editor/BSLKClubOptimizer.cs",
+            "Assets/BSLK-Optimizer/Editor/BSLKClubTextures.cs",
+            "Assets/BSLK-Optimizer/Editor/BSLKClubSdk.cs",
+            "Assets/BSLK-Optimizer/Editor/BSLKClubAnimation.cs",
+            "Assets/BSLK-Optimizer/Editor/BSLKUpdater.cs"
         };
 
         private const string ContentMarker = "namespace BSLK.Optimizer";
 
-        public static void CheckForUpdates(string repo, Action<string> onStatus)
+        public static void CheckForUpdates(string repo, Action<string> onStatus, Action onComplete = null)
         {
             if (string.IsNullOrEmpty(repo) || repo.IndexOf('/') <= 0)
             {
                 onStatus("Укажите репозиторий в формате owner/repo.");
+                onComplete?.Invoke();
                 return;
             }
 
@@ -37,6 +43,7 @@ namespace BSLK.Optimizer
             request.SetRequestHeader("User-Agent", "BSLK-Optimizer");
             request.SendWebRequest().completed += operation =>
             {
+                bool downloading = false;
                 try
                 {
                     if (request.result != UnityWebRequest.Result.Success)
@@ -67,7 +74,8 @@ namespace BSLK.Optimizer
                             "Обновить",
                             "Позже"))
                     {
-                        DownloadAndUpdate(repo, release.tag_name, onStatus);
+                        downloading = true;
+                        DownloadAndUpdate(repo, release.tag_name, onStatus, onComplete);
                     }
                     else
                     {
@@ -77,11 +85,12 @@ namespace BSLK.Optimizer
                 finally
                 {
                     request.Dispose();
+                    if (!downloading) onComplete?.Invoke();
                 }
             };
         }
 
-        private static void DownloadAndUpdate(string repo, string tag, Action<string> onStatus)
+        private static void DownloadAndUpdate(string repo, string tag, Action<string> onStatus, Action onComplete)
         {
             onStatus("Скачивание " + tag + "...");
 
@@ -89,14 +98,16 @@ namespace BSLK.Optimizer
             string owner = repo.Substring(0, slash);
             string repository = repo.Substring(slash + 1);
 
-            DownloadFiles(owner, repository, tag, 0, new string[UpdateFiles.Length], onStatus);
+            DownloadFiles(owner, repository, tag, 0, new string[UpdateFiles.Length], onStatus, onComplete);
         }
 
-        private static void DownloadFiles(string owner, string repository, string tag, int index, string[] contents, Action<string> onStatus)
+        private static void DownloadFiles(string owner, string repository, string tag, int index, string[] contents, Action<string> onStatus, Action onComplete)
         {
             if (index >= UpdateFiles.Length)
             {
-                WriteFiles(contents, tag, onStatus);
+                try { WriteFiles(contents, tag, onStatus); }
+                catch (Exception e) { onStatus("Обновление не установлено: " + e.Message); }
+                finally { onComplete?.Invoke(); }
                 return;
             }
 
@@ -112,11 +123,12 @@ namespace BSLK.Optimizer
                     if (request.result != UnityWebRequest.Result.Success || !request.downloadHandler.text.Contains(ContentMarker))
                     {
                         onStatus("Ошибка при скачивании: " + relative);
+                        onComplete?.Invoke();
                         return;
                     }
 
                     contents[index] = request.downloadHandler.text;
-                    DownloadFiles(owner, repository, tag, index + 1, contents, onStatus);
+                    DownloadFiles(owner, repository, tag, index + 1, contents, onStatus, onComplete);
                 }
                 finally
                 {
@@ -129,19 +141,32 @@ namespace BSLK.Optimizer
         {
             string version = tag.TrimStart('v', 'V');
 
+            string[] previous = new string[UpdateFiles.Length];
             for (int i = 0; i < UpdateFiles.Length; i++)
             {
-                string relative = UpdateFiles[i];
-                if (System.IO.File.Exists(relative))
-                {
-                    string backup = relative + ".bak";
-                    if (!System.IO.File.Exists(backup))
-                        System.IO.File.Copy(relative, backup);
-                }
-
-                string content = PatchVersionInContent(contents[i], version);
-                System.IO.File.WriteAllText(relative, content);
+                if (string.IsNullOrEmpty(contents[i]) || !contents[i].Contains(ContentMarker))
+                    throw new InvalidOperationException("Неполный комплект файлов обновления.");
+                previous[i] = System.IO.File.Exists(UpdateFiles[i]) ? System.IO.File.ReadAllText(UpdateFiles[i]) : null;
             }
+            AssetDatabase.DisallowAutoRefresh();
+            try
+            {
+                for (int i = 0; i < UpdateFiles.Length; i++)
+                {
+                    if (previous[i] != null) System.IO.File.WriteAllText(UpdateFiles[i] + ".bak", previous[i]);
+                    System.IO.File.WriteAllText(UpdateFiles[i], PatchVersionInContent(contents[i], version));
+                }
+            }
+            catch
+            {
+                for (int i = 0; i < UpdateFiles.Length; i++)
+                {
+                    if (previous[i] != null) System.IO.File.WriteAllText(UpdateFiles[i], previous[i]);
+                    else if (System.IO.File.Exists(UpdateFiles[i])) System.IO.File.Delete(UpdateFiles[i]);
+                }
+                throw;
+            }
+            finally { AssetDatabase.AllowAutoRefresh(); }
 
             EditorUtility.DisplayDialog(
                 "BSLK-Optimizer",

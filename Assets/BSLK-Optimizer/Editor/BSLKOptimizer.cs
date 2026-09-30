@@ -10,7 +10,7 @@ namespace BSLK.Optimizer
     {
         public const int MaxTextureSize = 2048;
 
-        public const string Version = "1.1.3";
+        public const string Version = "2.0.0";
 
         private static readonly string[] PlatformNames =
         {
@@ -124,7 +124,7 @@ namespace BSLK.Optimizer
 
                 GameObject[] roots = scene.GetRootGameObjects();
                 for (int i = 0; i < roots.Length; i++)
-                    roots[i].GetComponentsInChildren(true, lights);
+                    lights.AddRange(roots[i].GetComponentsInChildren<Light>(true));
             }
 
             Undo.SetCurrentGroupName("BSLK-Optimizer: удаление источников света");
@@ -157,8 +157,8 @@ namespace BSLK.Optimizer
                 GameObject[] roots = scene.GetRootGameObjects();
                 for (int i = 0; i < roots.Length; i++)
                 {
-                    roots[i].GetComponentsInChildren(true, cameras);
-                    roots[i].GetComponentsInChildren(true, listeners);
+                    cameras.AddRange(roots[i].GetComponentsInChildren<Camera>(true));
+                    listeners.AddRange(roots[i].GetComponentsInChildren<AudioListener>(true));
                 }
             }
 
@@ -192,7 +192,7 @@ namespace BSLK.Optimizer
 
                 GameObject[] roots = scene.GetRootGameObjects();
                 for (int i = 0; i < roots.Length; i++)
-                    roots[i].GetComponentsInChildren(true, probes);
+                    probes.AddRange(roots[i].GetComponentsInChildren<ReflectionProbe>(true));
             }
 
             Undo.SetCurrentGroupName("BSLK-Optimizer: удаление Reflection Probe");
@@ -218,6 +218,7 @@ namespace BSLK.Optimizer
 
             Mesh clone = UnityEngine.Object.Instantiate(mesh);
             clone.name = mesh.name;
+            SaveGeneratedMesh(clone);
             cloneMap[mesh] = clone;
 
             // Переназначить всем рендерерам, которые шарили этот меш
@@ -245,6 +246,13 @@ namespace BSLK.Optimizer
             return clone;
         }
 
+        private static void SaveGeneratedMesh(Mesh mesh)
+        {
+            const string folder = "Assets/BSLK-Optimizer-Generated";
+            if (!AssetDatabase.IsValidFolder(folder)) AssetDatabase.CreateFolder("Assets", "BSLK-Optimizer-Generated");
+            AssetDatabase.CreateAsset(mesh, AssetDatabase.GenerateUniqueAssetPath(folder + "/Mesh.asset"));
+        }
+
         public static int RemoveEmptyMaterialSlots(GameObject avatar)
         {
 
@@ -264,23 +272,16 @@ namespace BSLK.Optimizer
                 if (materials == null || materials.Length == 0)
                     continue;
 
+                // Removing an interior slot changes the material/submesh and animation indices.
                 int nullCount = 0;
-                for (int m = 0; m < materials.Length; m++)
-                {
-                    if (materials[m] == null)
-                        nullCount++;
-                }
+                for (int m = materials.Length - 1; m >= 0 && materials[m] == null; m--)
+                    nullCount++;
 
                 if (nullCount == 0)
                     continue;
 
                 Material[] newMaterials = new Material[materials.Length - nullCount];
-                int w = 0;
-                for (int m = 0; m < materials.Length; m++)
-                {
-                    if (materials[m] != null)
-                        newMaterials[w++] = materials[m];
-                }
+                System.Array.Copy(materials, newMaterials, newMaterials.Length);
 
                 Mesh mesh = null;
                 SkinnedMeshRenderer skinned = renderers[i] as SkinnedMeshRenderer;
@@ -443,8 +444,6 @@ namespace BSLK.Optimizer
                     continue;
                 }
 
-                mesh = EnsureMutableMesh(avatar, mesh, cloneMap, allRenderers);
-
                 int shapeCount = mesh.blendShapeCount;
                 int removeCount = 0;
                 for (int s = 0; s < shapeCount; s++)
@@ -455,6 +454,8 @@ namespace BSLK.Optimizer
 
                 if (removeCount == 0 || removeCount == shapeCount)
                     continue;
+
+                mesh = EnsureMutableMesh(avatar, mesh, cloneMap, allRenderers);
 
                 int vertexCount = mesh.vertexCount;
                 List<BlendShapeData> keep = new List<BlendShapeData>();
@@ -480,6 +481,17 @@ namespace BSLK.Optimizer
                     }
                 }
 
+                var weightsByRenderer = new Dictionary<SkinnedMeshRenderer, Dictionary<string, float>>();
+                foreach (SkinnedMeshRenderer renderer in renderers)
+                {
+                    if (renderer == null || renderer.sharedMesh != mesh) continue;
+                    var weights = new Dictionary<string, float>();
+                    for (int s = 0; s < mesh.blendShapeCount; s++)
+                        weights[mesh.GetBlendShapeName(s)] = renderer.GetBlendShapeWeight(s);
+                    weightsByRenderer[renderer] = weights;
+                    Undo.RecordObject(renderer, "BSLK-Optimizer: Blend Shapes");
+                }
+                Undo.RegisterCompleteObjectUndo(mesh, "BSLK-Optimizer: Blend Shapes");
                 mesh.ClearBlendShapes();
                 for (int s = 0; s < keep.Count; s++)
                 {
@@ -490,6 +502,9 @@ namespace BSLK.Optimizer
                     }
                 }
 
+                foreach (var entry in weightsByRenderer)
+                    for (int s = 0; s < mesh.blendShapeCount; s++)
+                        entry.Key.SetBlendShapeWeight(s, entry.Value[mesh.GetBlendShapeName(s)]);
                 try { mesh.RecalculateBounds(); } catch { }
                 EditorUtility.SetDirty(mesh);
                 report.meshes++;
@@ -712,7 +727,6 @@ namespace BSLK.Optimizer
             List<Renderer> allRenderers = new List<Renderer>();
             TryCollectRenderers(avatar, allRenderers);
             Dictionary<Mesh, Mesh> cloneMap = new Dictionary<Mesh, Mesh>();
-            Dictionary<Mesh, Transform[]> processedBones = new Dictionary<Mesh, Transform[]>();
 
             for (int i = 0; i < renderers.Count; i++)
             {
@@ -728,19 +742,6 @@ namespace BSLK.Optimizer
 
                 if (mesh == null || bones == null || bones.Length == 0)
                     continue;
-
-                if (processedBones.TryGetValue(mesh, out Transform[] cachedBones))
-                {
-                    if (renderer.bones.Length != cachedBones.Length)
-                    {
-                        Undo.RecordObject(renderer, "BSLK-Optimizer: удаление неиспользуемых костей");
-                        renderer.bones = cachedBones;
-                        if (renderer.rootBone != null && System.Array.IndexOf(cachedBones, renderer.rootBone) < 0)
-                            renderer.rootBone = cachedBones.Length > 0 ? cachedBones[0] : null;
-                        EditorUtility.SetDirty(renderer);
-                    }
-                    continue;
-                }
 
                 if (!mesh.isReadable)
                 {
@@ -764,8 +765,8 @@ namespace BSLK.Optimizer
                     continue;
                 }
 
-                MarkAncestorsAsUsed(used, bones, renderer.rootBone);
                 MarkPhysBoneBonesAsUsed(used, bones);
+                MarkAncestorsAsUsed(used, bones, renderer.rootBone);
 
                 bool hasUnused = false;
                 for (int b = 0; b < used.Length; b++)
@@ -780,8 +781,13 @@ namespace BSLK.Optimizer
                 if (!hasUnused)
                     continue;
 
-                Mesh originalMesh = mesh;
-                mesh = EnsureMutableMesh(avatar, mesh, cloneMap, allRenderers);
+                // Bindings belong to the renderer, not to the shared mesh. Never copy another
+                // renderer's Transform[] even when both renderers share the same source mesh.
+                mesh = UnityEngine.Object.Instantiate(mesh);
+                mesh.name = renderer.sharedMesh.name + "_Bones";
+                SaveGeneratedMesh(mesh);
+                Undo.RecordObject(renderer, "BSLK-Optimizer: копия меша для костей");
+                renderer.sharedMesh = mesh;
 
                 int[] remap = new int[used.Length];
                 List<Transform> newBones = new List<Transform>();
@@ -830,9 +836,6 @@ namespace BSLK.Optimizer
                 Transform[] newBonesArray = newBones.ToArray();
                 mesh.bindposes = newBindposes.ToArray();
                 renderer.bones = newBonesArray;
-                processedBones[originalMesh] = newBonesArray;
-                if (originalMesh != mesh)
-                    processedBones[mesh] = newBonesArray;
 
                 int rootIdx = renderer.rootBone != null ? FindBoneIndex(renderer.rootBone, bones) : -1;
                 if (rootIdx >= 0 && !used[rootIdx])
@@ -867,7 +870,7 @@ namespace BSLK.Optimizer
 
             GameObject[] roots = scene.GetRootGameObjects();
             for (int i = 0; i < roots.Length; i++)
-                roots[i].GetComponentsInChildren(true, renderers);
+                renderers.AddRange(roots[i].GetComponentsInChildren<SkinnedMeshRenderer>(true));
 
             return true;
         }
@@ -889,7 +892,7 @@ namespace BSLK.Optimizer
 
             GameObject[] roots = scene.GetRootGameObjects();
             for (int i = 0; i < roots.Length; i++)
-                roots[i].GetComponentsInChildren(true, renderers);
+                renderers.AddRange(roots[i].GetComponentsInChildren<Renderer>(true));
 
             return true;
         }
@@ -1296,7 +1299,7 @@ namespace BSLK.Optimizer
 
                 GameObject[] roots = scene.GetRootGameObjects();
                 for (int i = 0; i < roots.Length; i++)
-                    roots[i].GetComponentsInChildren(true, renderers);
+                    renderers.AddRange(roots[i].GetComponentsInChildren<Renderer>(true));
             }
 
             int vertexCount = 0;
@@ -1328,7 +1331,8 @@ namespace BSLK.Optimizer
                 {
                     meshCount++;
                     vertexCount += mesh.vertexCount;
-                    triangleCount += mesh.triangles.Length / 3;
+                    for (int s = 0; s < mesh.subMeshCount; s++)
+                        if (mesh.GetTopology(s) == MeshTopology.Triangles) triangleCount += (int)(mesh.GetIndexCount(s) / 3);
                     blendShapeCount += mesh.blendShapeCount;
                 }
 
