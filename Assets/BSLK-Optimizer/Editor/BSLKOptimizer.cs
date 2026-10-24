@@ -11,6 +11,8 @@ namespace BSLK.Optimizer
         public const int MaxTextureSize = 2048;
 
         public const string Version = "2.0.0";
+        public const string Contact = "GedHamus";
+        public const string Discord = "https://discord.gg/ugC6vSKUfg";
 
         private static readonly string[] PlatformNames =
         {

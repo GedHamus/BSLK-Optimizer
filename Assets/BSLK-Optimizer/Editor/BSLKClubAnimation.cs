@@ -14,7 +14,7 @@ namespace BSLK.Optimizer
         // Mixed toggles retain their other actions (gestures, blendshapes, sounds, etc.).
         internal static void FreezeBuildToggles(BSLKClubOptimizer.Context context)
         {
-            ResolveOutfitToggles(context);
+            HashSet<Component> worn = ResolveOutfitToggles(context);
             PruneActions(context, (type, action) =>
             {
                 if (type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal))
@@ -28,21 +28,21 @@ namespace BSLK.Optimizer
                     return target != null && context.rendererPaths.Contains(AnimationUtility.CalculateTransformPath(target.transform, context.avatar.transform));
                 }
                 return false;
-            }, "VRCFury: удалено действий переключения одежды {0}, пустых переключателей {1}.");
+            }, "VRCFury: удалено действий переключения одежды {0}, пустых переключателей {1}.", worn);
         }
 
-        // A clothing toggle (object actions, optionally with body blend shapes such as shrink keys)
-        // is resolved from the scene state the user selected. Selected ON: its blend shapes are
-        // baked into the renderers and the menu toggle disappears. Selected OFF: the whole toggle,
-        // including its shrink keys, is removed. Toggles with other work or unclear state are kept.
-        private static void ResolveOutfitToggles(BSLKClubOptimizer.Context context)
+        // A clothing toggle (object actions, optionally with shrink keys and other work) follows the
+        // scene state the user selected. Worn: the toggle stays in the menu, intact, and starts ON, so
+        // the club avatar loads in the chosen outfit and the item can still be taken off. Not worn:
+        // the whole toggle, including its shrink keys, is removed with the item. Unclear: untouched here.
+        private static HashSet<Component> ResolveOutfitToggles(BSLKClubOptimizer.Context context)
         {
-            int baked = 0, removed = 0;
+            var worn = new HashSet<Component>();
+            int removed = 0;
             foreach (Component component in context.avatar.GetComponentsInChildren<Component>(true))
             {
                 if (component == null || component.GetType().FullName != "VF.Model.VRCFury") continue;
                 bool? selected = null;
-                var shapes = new List<KeyValuePair<Renderer, KeyValuePair<string, float>>>();
                 using (var serialized = new SerializedObject(component))
                 {
                     SerializedProperty content = serialized.FindProperty("content");
@@ -53,63 +53,41 @@ namespace BSLK.Optimizer
                     if (Flag(content, "enableDriveGlobalParam") || Flag(content, "useGlobalParam") || Flag(content, "slider") || Flag(content, "separateLocal")) continue;
                     SerializedProperty actions = content.FindPropertyRelative("state.actions");
                     if (actions == null || !actions.isArray) continue;
-                    bool unclear = false, other = false;
+                    bool unclear = false;
                     for (int i = 0; i < actions.arraySize; i++)
                     {
                         SerializedProperty action = actions.GetArrayElementAtIndex(i);
                         string type = action.propertyType == SerializedPropertyType.ManagedReference ? action.managedReferenceFullTypename : "";
-                        if (type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal))
-                        {
-                            GameObject target = action.FindPropertyRelative("obj")?.objectReferenceValue as GameObject;
-                            if (target == null || !target.transform.IsChildOf(context.avatar.transform)) { unclear = true; continue; }
-                            // VRCFury modes: 0 TurnOn, 1 TurnOff, 2 Toggle (ON inverts the current state).
-                            int mode = action.FindPropertyRelative("mode")?.enumValueIndex ?? 0;
-                            bool on = mode == 0 ? target.activeInHierarchy : mode == 1 ? !target.activeInHierarchy : false;
-                            if (selected == null) selected = on;
-                            else if (selected != on) unclear = true;
-                        }
-                        else if (type.EndsWith(" VF.Model.StateAction.BlendShapeAction", StringComparison.Ordinal))
-                        {
-                            string name = action.FindPropertyRelative("blendShape")?.stringValue;
-                            float value = action.FindPropertyRelative("blendShapeValue")?.floatValue ?? 100;
-                            Renderer renderer = Flag(action, "allRenderers") ? null : action.FindPropertyRelative("renderer")?.objectReferenceValue as Renderer;
-                            if (string.IsNullOrEmpty(name)) continue;
-                            shapes.Add(new KeyValuePair<Renderer, KeyValuePair<string, float>>(renderer, new KeyValuePair<string, float>(name, value)));
-                        }
-                        else other = true;
+                        if (!type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal)) continue;
+                        GameObject target = action.FindPropertyRelative("obj")?.objectReferenceValue as GameObject;
+                        if (target == null || !target.transform.IsChildOf(context.avatar.transform)) { unclear = true; continue; }
+                        // VRCFury modes: 0 TurnOn, 1 TurnOff, 2 Toggle (ON inverts the current state).
+                        int mode = action.FindPropertyRelative("mode")?.enumValueIndex ?? 0;
+                        bool on = mode == 0 ? target.activeInHierarchy : mode == 1 ? !target.activeInHierarchy : false;
+                        if (selected == null) selected = on;
+                        else if (selected != on) unclear = true;
                     }
                     if (unclear || selected == null) continue;
-                    // A selected toggle with clips, materials, sounds etc. cannot be baked safely.
-                    if (selected == true && other) continue;
+                    if (selected == true)
+                    {
+                        SerializedProperty defaultOn = content.FindPropertyRelative("defaultOn");
+                        if (defaultOn != null) defaultOn.boolValue = true;
+                        serialized.ApplyModifiedPropertiesWithoutUndo();
+                        worn.Add(component);
+                        continue;
+                    }
                 }
-                if (selected == true)
-                {
-                    foreach (var shape in shapes) BakeBlendShape(context.avatar, shape.Key, shape.Value.Key, shape.Value.Value);
-                    baked++;
-                }
-                else removed++;
                 Object.DestroyImmediate(component);
+                removed++;
             }
-            context.notes.Add("VRCFury: выбранных переключателей одежды закреплено " + baked + " (их blend shapes применены), невыбранных удалено " + removed + ".");
+            context.notes.Add("VRCFury: переключателей надетой одежды оставлено в меню " + worn.Count + " (включены по умолчанию), переключателей удалённых вещей убрано " + removed + ".");
+            return worn;
         }
 
         private static bool Flag(SerializedProperty parent, string name)
         {
             SerializedProperty property = parent.FindPropertyRelative(name);
             return property != null && property.propertyType == SerializedPropertyType.Boolean && property.boolValue;
-        }
-
-        // VRCFury applies an "all renderers" blend shape to every renderer that has it.
-        private static void BakeBlendShape(GameObject avatar, Renderer target, string name, float value)
-        {
-            IEnumerable<SkinnedMeshRenderer> renderers = target != null
-                ? new[] { target as SkinnedMeshRenderer }
-                : avatar.GetComponentsInChildren<SkinnedMeshRenderer>(true);
-            foreach (SkinnedMeshRenderer renderer in renderers)
-            {
-                int index = renderer != null && renderer.sharedMesh != null ? renderer.sharedMesh.GetBlendShapeIndex(name) : -1;
-                if (index >= 0) renderer.SetBlendShapeWeight(index, value);
-            }
         }
 
         // Any action (toggle, material, blend shape, flipbook, ...) that references an object about
@@ -132,12 +110,12 @@ namespace BSLK.Optimizer
             }, "VRCFury: удалено действий, направленных на удалённые объекты, {0}; опустевших переключателей {1}.");
         }
 
-        private static void PruneActions(BSLKClubOptimizer.Context context, Func<string, SerializedProperty, bool> shouldRemove, string note)
+        private static void PruneActions(BSLKClubOptimizer.Context context, Func<string, SerializedProperty, bool> shouldRemove, string note, HashSet<Component> skip = null)
         {
             int actionsRemoved = 0, togglesRemoved = 0;
             foreach (Component component in context.avatar.GetComponentsInChildren<Component>(true))
             {
-                if (component == null || component.GetType().FullName != "VF.Model.VRCFury") continue;
+                if (component == null || component.GetType().FullName != "VF.Model.VRCFury" || (skip != null && skip.Contains(component))) continue;
                 bool destroy = false;
                 using (var serialized = new SerializedObject(component))
                 {

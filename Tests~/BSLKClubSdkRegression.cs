@@ -103,13 +103,17 @@ public static class BSLKClubSdkRegression
             if (copiedBone.ignoreTransforms.Count != 0 || physBone.ignoreTransforms.Count != 1) throw new Exception("Missing ignoreTransforms entry left behind");
             var copiedBody = result.avatar.transform.Find("Body").GetComponent<SkinnedMeshRenderer>();
             Mesh copiedBodyMesh = copiedBody.sharedMesh;
-            // ShrinkJ belonged only to the removed jacket toggle, so the unused shape is dropped as well.
-            if (copiedBody.GetBlendShapeWeight(copiedBodyMesh.GetBlendShapeIndex("Shrink")) != 100 || copiedBodyMesh.GetBlendShapeIndex("ShrinkJ") >= 0 ||
+            // The worn shirt keeps its toggle (and its Shrink key for VRCFury); ShrinkJ belonged only to the removed jacket.
+            if (copiedBodyMesh.GetBlendShapeIndex("Shrink") < 0 || copiedBodyMesh.GetBlendShapeIndex("ShrinkJ") >= 0 ||
                 copiedBody.GetBlendShapeWeight(copiedBodyMesh.GetBlendShapeIndex("Smile")) != 0 ||
                 bodyRenderer.GetBlendShapeWeight(0) != 0 || bodyMesh.blendShapeCount != 3 || result.avatar.transform.Find("Jacket") != null)
-                throw new Exception("Selected outfit toggle was not baked, or the removed one was applied");
+                throw new Exception("Worn outfit shape lost, or the removed jacket's shape kept/applied");
+            var keptToggles = result.avatar.GetComponents(furyType);
+            var shirtToggle = keptToggles.Select(t => new SerializedObject(t)).FirstOrDefault(t => t.FindProperty("content.state.actions").arraySize == 2);
+            if (shirtToggle == null || !shirtToggle.FindProperty("content.defaultOn").boolValue)
+                throw new Exception("Toggle of worn clothing must stay in the menu, intact and ON by default");
             if (Directory.GetFiles(result.folder, "JacketMat*").Length != 0) throw new Exception("Material of deleted jacket left in result");
-            if (result.avatar.GetComponents(furyType).Length != 1 || root.GetComponents(furyType).Length != 5)
+            if (result.avatar.GetComponents(furyType).Length != 2 || root.GetComponents(furyType).Length != 5)
                 throw new Exception("VRCFury clothing/SPS cleanup or source isolation failed");
             if (result.avatar.transform.Find("Hair/HairChild/Hat") != null || result.avatar.transform.Find("Hair/Ignored") != null ||
                 result.avatar.transform.Find("Hair/HairChild/HairLeaf/SpareBone") == null || root.transform.Find("Hair/HairChild/Hat") == null)
@@ -135,7 +139,7 @@ public static class BSLKClubSdkRegression
             // Build check: VRCFury processes a temporary clone; the result itself keeps its components.
             int roots = root.scene.rootCount;
             if (!BSLKClubSdk.TryAnalyzeBuilt(result.avatar, out string built, out string buildReason)) throw new Exception("Build check failed: " + buildReason);
-            if (!built.Contains("ПОСЛЕ СБОРКИ") || result.avatar.GetComponents(furyType).Length != 1 || root.scene.rootCount != roots)
+            if (!built.Contains("ПОСЛЕ СБОРКИ") || result.avatar.GetComponents(furyType).Length != 2 || root.scene.rootCount != roots)
                 throw new Exception("Build check changed the result or left a clone behind");
             Debug.Log("BUILD CHECK:\n" + built);
             Object.DestroyImmediate(stripped.avatar);

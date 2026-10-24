@@ -131,7 +131,8 @@ namespace BSLK.Optimizer
                 RemoveUnusedCopies(context, prefabPath);
                 context.notes.Add("Исходный аватар не изменён. Копия и её ассеты: " + context.folder);
                 context.notes.Add("Сравните исходник и Club, включая лицо, одежду и мимику. Перед загрузкой проверьте итог в VRChat SDK.");
-                string report = "BSLK Optimizer " + BSLKOptimizer.Version + " • автор GedHamus\n\nДО\n" + before + "\n\nПОСЛЕ\n" + Analyze(context.avatar) +
+                string report = "BSLK Optimizer " + BSLKOptimizer.Version + " • по любым вопросам пишите " + BSLKOptimizer.Contact +
+                    " • Discord BELKA&STRELKA: " + BSLKOptimizer.Discord + "\n\nДО\n" + before + "\n\nПОСЛЕ\n" + Analyze(context.avatar) +
                     "\n\nИЗМЕНЕНИЯ И ЗАМЕЧАНИЯ\n" + string.Join("\n", context.notes) +
                     "\n\nКТО ЗАНИМАЕТ ЛИМИТЫ (ПОСЛЕ)\n" + BSLKClubInsights.Format(BSLKClubInsights.Collect(context.avatar));
                 File.WriteAllText(context.folder + "/Report.txt", report);
@@ -366,13 +367,19 @@ namespace BSLK.Optimizer
         {
             var locked = new HashSet<Renderer>();
             Transform root = c.avatar.transform;
+            var animated = new HashSet<string>();
+            var toggled = new HashSet<string>();
             foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
             {
                 if (component == null || component is Transform || component is Renderer || component is MeshFilter) continue;
-                foreach (Object reference in References(component)) if (reference is Renderer renderer) locked.Add(renderer);
+                foreach (Object reference in References(component))
+                {
+                    if (reference is Renderer renderer) locked.Add(renderer);
+                    // Objects switched by build-time toggles (VRCFury etc.) count as animated visibility.
+                    else if (reference is GameObject target && target != component.gameObject && target.transform.IsChildOf(root) && target.transform != root)
+                        toggled.Add(Relative(target.transform, c));
+                }
             }
-            var animated = new HashSet<string>();
-            var toggled = new HashSet<string>();
             foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
             {
                 foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
