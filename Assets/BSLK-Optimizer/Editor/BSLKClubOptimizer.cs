@@ -32,6 +32,8 @@ namespace BSLK.Optimizer
             public bool removeUnusedShapesAndBones = true;
             public bool keepMmdShapes = true;
             public bool removeHiddenBody = true;
+            // Worn clothing that still has a menu toggle counts as cover; taking it off in game shows a gap.
+            public bool hiddenUnderToggledClothing = true;
             // PhysBones whose colliders are dropped: "path#index" keys from BSLKClubInsights.PhysBones.
             public readonly HashSet<string> stripColliders = new HashSet<string>();
             public System.Threading.CancellationToken cancellationToken;
@@ -114,8 +116,9 @@ namespace BSLK.Optimizer
                 HashSet<Renderer> locked = LockedRenderers(context, out HashSet<Renderer> toggleable);
                 // Body under worn clothing is cut only when deleting disabled items was not enough.
                 if (options.removeHiddenBody && TriangleTotal(context.avatar) > TriangleLimit)
-                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => !toggleable.Contains(renderer), mesh => SaveMesh(context, mesh), context.notes,
-                        LiveShapes(context.avatar, context.copies.Values.OfType<AnimationClip>().Distinct()));
+                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => options.hiddenUnderToggledClothing || !toggleable.Contains(renderer),
+                        mesh => SaveMesh(context, mesh), context.notes,
+                        LiveShapes(context.avatar, context.copies.Values.OfType<AnimationClip>().Distinct(), options.hiddenUnderToggledClothing));
                 if (options.mergeMeshes) BSLKClubGeometry.MergeClothing(context.avatar, locked, ClubClips(context), mesh => SaveMesh(context, mesh), context.notes);
                 if (options.mergeMaterials)
                     context.notes.Add("Объединено слотов с одинаковым материалом: " + BSLKClubGeometry.MergeDuplicateSlots(context.avatar, locked, mesh => SaveMesh(context, mesh)) + ".");
@@ -458,7 +461,9 @@ namespace BSLK.Optimizer
         // used for eyelids, or a standard MMD morph; drop the rest from the copy.
         // Shape names that can change at runtime: animated by clips or named by components
         // (visemes, VRCFury toggles and gestures). Non-zero weights are checked by the callers.
-        internal static HashSet<string> LiveShapes(GameObject avatar, IEnumerable<AnimationClip> clips)
+        // ignoreClothingToggles: shrink keys of VRCFury clothing toggles are not live when that worn
+        // clothing is treated as permanent (the body under it is cut anyway).
+        internal static HashSet<string> LiveShapes(GameObject avatar, IEnumerable<AnimationClip> clips, bool ignoreClothingToggles = false)
         {
             var live = new HashSet<string>();
             foreach (AnimationClip clip in clips)
@@ -469,12 +474,27 @@ namespace BSLK.Optimizer
                 if (component == null || component is Transform || component is Renderer) continue;
                 using (var serialized = new SerializedObject(component))
                 {
+                    if (ignoreClothingToggles && IsClothingToggle(serialized)) continue;
                     SerializedProperty property = serialized.GetIterator();
                     while (property.Next(true))
                         if (property.propertyType == SerializedPropertyType.String && !string.IsNullOrEmpty(property.stringValue)) live.Add(property.stringValue);
                 }
             }
             return live;
+        }
+
+        private static bool IsClothingToggle(SerializedObject serialized)
+        {
+            if (serialized.targetObject.GetType().FullName != "VF.Model.VRCFury") return false;
+            SerializedProperty actions = serialized.FindProperty("content.state.actions");
+            if (actions == null || !actions.isArray) return false;
+            for (int i = 0; i < actions.arraySize; i++)
+            {
+                SerializedProperty action = actions.GetArrayElementAtIndex(i);
+                if (action.propertyType == SerializedPropertyType.ManagedReference &&
+                    action.managedReferenceFullTypename.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal)) return true;
+            }
+            return false;
         }
 
         private static void RemoveUnusedShapesAndBones(Context c, Options options)

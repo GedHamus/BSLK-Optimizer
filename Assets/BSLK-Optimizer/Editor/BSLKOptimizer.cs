@@ -2453,29 +2453,44 @@ namespace BSLK.Optimizer
                     faces[t] = n;
                     for (int k = 0; k < 3; k++) normals[g.welded[tri[t * 3 + k]]] += n;
                 }
-                var state = new sbyte[g.moved.Length]; // 0 unknown, 1 hidden, -1 visible
                 var result = new bool[count];
+                // Rays are independent: vertices and then triangles are traced in parallel, in chunks so the
+                // cancelable progress bar (main thread only) stays responsive.
+                var position = new Vector3[g.moved.Length];
+                var needed = new bool[g.moved.Length];
                 for (int t = 0; t < count; t++)
                 {
-                    if ((t & 2047) == 0) BSLKClubOptimizer.Progress("Скрытые треугольники: " + g.renderer.name, progress);
-                    if (skip != null && skip[t]) { result[t] = true; continue; }
-                    if (only != null && !only[t]) continue;
-                    Vector3 face = faces[t];
-                    float area = face.magnitude;
-                    if (area < 1e-12f) continue;
-                    face /= area;
-                    bool hiddenAll = true;
-                    for (int k = 0; k < 3 && hiddenAll; k++)
+                    if ((skip != null && skip[t]) || (only != null && !only[t])) continue;
+                    for (int k = 0; k < 3; k++) { int v = tri[t * 3 + k]; position[g.welded[v]] = p[v]; needed[g.welded[v]] = true; }
+                }
+                int[] ids = Enumerable.Range(0, needed.Length).Where(id => needed[id]).ToArray();
+                var state = new sbyte[g.moved.Length]; // 0 unknown, 1 hidden, -1 visible
+                const int Chunk = 8192;
+                for (int start = 0; start < ids.Length; start += Chunk)
+                {
+                    BSLKClubOptimizer.Progress("Скрытые треугольники: " + g.renderer.name, progress);
+                    System.Threading.Tasks.Parallel.For(start, Math.Min(ids.Length, start + Chunk), i =>
                     {
-                        int v = tri[t * 3 + k], id = g.welded[v];
-                        if (state[id] == 0) state[id] = (sbyte)(PointHidden(p[v], Unit(normals[id]), owner, ignore) ? 1 : -1);
-                        hiddenAll = state[id] > 0;
-                    }
-                    if (!hiddenAll) continue;
-                    Vector3 v0 = p[tri[t * 3]], v1 = p[tri[t * 3 + 1]], v2 = p[tri[t * 3 + 2]], centre = (v0 + v1 + v2) / 3f;
-                    hiddenAll = PointHidden(centre, face, owner, ignore) && PointHidden((v0 + centre) * 0.5f, face, owner, ignore) &&
-                        PointHidden((v1 + centre) * 0.5f, face, owner, ignore) && PointHidden((v2 + centre) * 0.5f, face, owner, ignore);
-                    result[t] = hiddenAll;
+                        int id = ids[i];
+                        state[id] = (sbyte)(PointHidden(position[id], Unit(normals[id]), owner, ignore) ? 1 : -1);
+                    });
+                }
+                for (int start = 0; start < count; start += Chunk)
+                {
+                    BSLKClubOptimizer.Progress("Скрытые треугольники: " + g.renderer.name, progress);
+                    System.Threading.Tasks.Parallel.For(start, Math.Min(count, start + Chunk), t =>
+                    {
+                        if (skip != null && skip[t]) { result[t] = true; return; }
+                        if (only != null && !only[t]) return;
+                        if (state[g.welded[tri[t * 3]]] < 0 || state[g.welded[tri[t * 3 + 1]]] < 0 || state[g.welded[tri[t * 3 + 2]]] < 0) return;
+                        Vector3 face = faces[t];
+                        float area = face.magnitude;
+                        if (area < 1e-12f) return;
+                        face /= area;
+                        Vector3 v0 = p[tri[t * 3]], v1 = p[tri[t * 3 + 1]], v2 = p[tri[t * 3 + 2]], centre = (v0 + v1 + v2) / 3f;
+                        result[t] = PointHidden(centre, face, owner, ignore) && PointHidden((v0 + centre) * 0.5f, face, owner, ignore) &&
+                            PointHidden((v1 + centre) * 0.5f, face, owner, ignore) && PointHidden((v2 + centre) * 0.5f, face, owner, ignore);
+                    });
                 }
                 return result;
             }
@@ -2505,7 +2520,8 @@ namespace BSLK.Optimizer
             private readonly int[] order;
             private readonly float[] boxes;  // min xyz, max xyz per node
             private readonly int[] first, count, left, right;
-            private readonly int[] stack = new int[256];
+            // Per thread: visibility rays are traced in parallel.
+            [ThreadStatic] private static int[] stack;
 
             public Bvh(List<Geometry> geometries)
             {
@@ -2611,6 +2627,7 @@ namespace BSLK.Optimizer
                 float ox = origin.x, oy = origin.y, oz = origin.z, dx = direction.x, dy = direction.y, dz = direction.z;
                 float ix = 1f / (Math.Abs(dx) > 1e-12f ? dx : 1e-12f), iy = 1f / (Math.Abs(dy) > 1e-12f ? dy : 1e-12f), iz = 1f / (Math.Abs(dz) > 1e-12f ? dz : 1e-12f);
                 int sp = 0;
+                if (stack == null) stack = new int[256];
                 stack[sp++] = 0;
                 while (sp > 0)
                 {

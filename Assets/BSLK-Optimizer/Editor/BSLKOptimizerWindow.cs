@@ -22,6 +22,7 @@ namespace BSLK.Optimizer
         [SerializeField] private bool removeUnusedShapesAndBones = true;
         [SerializeField] private bool keepMmdShapes = true;
         [SerializeField] private bool removeHiddenBody = true;
+        [SerializeField] private bool hiddenUnderToggledClothing = true;
         [SerializeField] private List<Texture> protectedTextures = new List<Texture>();
         [SerializeField] private List<string> stripColliders = new List<string>();
         [SerializeField] private string report = "";
@@ -184,6 +185,8 @@ namespace BSLK.Optimizer
                 using (new EditorGUI.DisabledScope(!removeUnusedShapesAndBones))
                     keepMmdShapes = EditorGUILayout.ToggleLeft("Сохранять MMD-ключи лица", keepMmdShapes);
                 removeHiddenBody = EditorGUILayout.ToggleLeft("Вырезать тело под одеждой, если после удаления выключенного всё ещё больше 500K", removeHiddenBody);
+                using (new EditorGUI.DisabledScope(!removeHiddenBody))
+                    hiddenUnderToggledClothing = EditorGUILayout.ToggleLeft(ToggledCoverLabel, hiddenUnderToggledClothing);
                 GUILayout.Label("Лицо, visemes, всё, на что ссылаются компоненты (VRCFury и др.), рендереры с анимацией материалов или включения и объекты под вложенными Animator не объединяются.", small);
                 EditorGUI.indentLevel--;
             }
@@ -471,6 +474,8 @@ namespace BSLK.Optimizer
 
         // ---- Body under clothing, on demand
 
+        private const string ToggledCoverLabel = "Считать укрытием и одежду с тогглом (если снять её в игре, под ней будет пусто)";
+
         private void HiddenBodyTool()
         {
             BeginCard("Вырезать тело под одеждой", Orange);
@@ -482,7 +487,8 @@ namespace BSLK.Optimizer
                 return;
             }
             GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: в сцене получит новые меши, файлы моделей не меняются)") +
-                ". Убираются треугольники тела, полностью закрытые одеждой в текущей позе. Одежда, которую можно снять тогглом или анимацией, и прозрачная одежда укрытием не считаются, чтобы не появлялись дыры. Вернуть можно в списке изменённых мешей ниже.", small);
+                ". Убираются треугольники тела, полностью закрытые надетой одеждой в текущей позе. Прозрачная одежда укрытием не считается. Вернуть можно в списке изменённых мешей ниже.", small);
+            hiddenUnderToggledClothing = EditorGUILayout.ToggleLeft(ToggledCoverLabel, hiddenUnderToggledClothing);
             if (ColoredButton("Вырезать скрытое тело", Orange)) EditorApplication.delayCall += CutHiddenBody;
             if (!string.IsNullOrEmpty(hiddenNote)) GUILayout.Label(hiddenNote, wrap);
             EndCard();
@@ -504,11 +510,11 @@ namespace BSLK.Optimizer
             try
             {
                 string folder = target == lastResult ? ResultFolder() : SimplifiedFolder();
-                BSLKClubOcclusion.RemoveHiddenTriangles(target, locked, renderer => !toggleable.Contains(renderer), mesh =>
+                BSLKClubOcclusion.RemoveHiddenTriangles(target, locked, renderer => hiddenUnderToggledClothing || !toggleable.Contains(renderer), mesh =>
                 {
                     AssetDatabase.CreateAsset(mesh, AssetDatabase.GenerateUniqueAssetPath(folder + "/" + mesh.name + "_hidden.asset"));
                     return mesh;
-                }, notes, BSLKClubOptimizer.LiveShapes(target, clips));
+                }, notes, BSLKClubOptimizer.LiveShapes(target, clips, hiddenUnderToggledClothing));
                 // Remember each original so the cut can be undone from the list of changed meshes later.
                 foreach (SkinnedMeshRenderer renderer in renderers)
                 {
@@ -722,7 +728,7 @@ namespace BSLK.Optimizer
                 singleOutfit = singleOutfit, optimizeTextures = optimizeTextures,
                 limitParticles = limitParticles, minimumTextureSize = minimumTextureSize, textureError = textureError,
                 mergeTextures = mergeTextures, mergeMaterials = mergeMaterials, mergeMeshes = mergeMeshes,
-                removeUnusedShapesAndBones = removeUnusedShapesAndBones, keepMmdShapes = keepMmdShapes, removeHiddenBody = removeHiddenBody
+                removeUnusedShapesAndBones = removeUnusedShapesAndBones, keepMmdShapes = keepMmdShapes, removeHiddenBody = removeHiddenBody, hiddenUnderToggledClothing = hiddenUnderToggledClothing
             };
             foreach (Texture texture in protectedTextures) if (texture != null) options.protectedTextures.Add(texture);
             options.stripColliders.UnionWith(stripColliders);
