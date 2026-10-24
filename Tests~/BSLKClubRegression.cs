@@ -39,6 +39,8 @@ public static class BSLKClubRegression
             AdaptiveTextures();
             MergeAndDeduplicate();
             Simplification();
+            ImportedModel();
+            SimplifyAndRestore();
             Debug.Log("BSLK REGRESSION PASSED: " + checks + " assertions");
             File.WriteAllText("test-results.txt", "PASSED: " + checks + " assertions");
             EditorApplication.Exit(0);
@@ -301,11 +303,113 @@ public static class BSLKClubRegression
         int before = BSLKClubGeometry.TriangleCount(mesh), after = BSLKClubGeometry.TriangleCount(simple);
         Check(after <= before * 0.5f && after > 0 && simple.vertexCount < mesh.vertexCount && simple.blendShapeCount == 1 &&
             Mathf.Abs(simple.bounds.size.x - mesh.bounds.size.x) < 0.01f && Mathf.Abs(simple.bounds.size.z - mesh.bounds.size.z) < 0.01f, "Simplification: " + before + " → " + after + " triangles, border and shapes kept");
+        // A model imported without Read/Write, like a typical source avatar FBX.
+        var obj = new System.Text.StringBuilder();
+        foreach (Vector3 v in vertices) obj.AppendLine("v " + v.x.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + v.y.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + v.z.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        for (int t = 0; t < triangles.Count; t += 3) obj.AppendLine("f " + (triangles[t] + 1) + " " + (triangles[t + 1] + 1) + " " + (triangles[t + 2] + 1));
+        string modelPath = fixture + "/Grid.obj";
+        File.WriteAllText(modelPath, obj.ToString());
+        AssetDatabase.ImportAsset(modelPath, ImportAssetOptions.ForceSynchronousImport);
+        var modelImporter = (ModelImporter)AssetImporter.GetAtPath(modelPath);
+        modelImporter.isReadable = false; modelImporter.meshOptimizationFlags = 0; modelImporter.SaveAndReimport();
+        Mesh imported = AssetDatabase.LoadAllAssetsAtPath(modelPath).OfType<Mesh>().First();
+        int importedBefore = BSLKClubGeometry.TriangleCount(imported);
+        Mesh importedSimple = BSLKClubGeometry.Simplify(imported, 0.3f, false);
+        Check(!imported.isReadable && BSLKClubGeometry.TriangleCount(importedSimple) <= importedBefore * 0.5f && BSLKClubGeometry.TriangleCount(imported) == importedBefore,
+            "Model without Read/Write simplified into a new mesh, source untouched");
         Mesh lockedShapes = BSLKClubGeometry.Simplify(mesh, 0.3f, true);
         Check(BSLKClubGeometry.TriangleCount(lockedShapes) == before, "Vertices moved by blend shapes are not simplified when protected");
     }
 
-    private static Texture2D MakeTexture(string name, bool checker, bool darkNoise = false)
+    // Source models usually have Read/Write off: club operations must still work on the copy,
+    // and the copy must end up with Read/Write off again.
+    private static void ImportedModel()
+    {
+        string path = fixture + "/TwoParts.obj";
+        File.WriteAllText(path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nusemtl A\nf 1 2 3\nusemtl B\nf 2 4 3\n");
+        AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceSynchronousImport);
+        var importer = (ModelImporter)AssetImporter.GetAtPath(path);
+        importer.isReadable = false; importer.SaveAndReimport();
+        string meta = File.ReadAllText(path + ".meta");
+        Mesh model = AssetDatabase.LoadAllAssetsAtPath(path).OfType<Mesh>().First();
+        var root = new GameObject("Imported");
+        GameObject part = MeshObject(root, "Part", MakeMaterial("PartA"));
+        part.GetComponent<MeshFilter>().sharedMesh = model;
+        Mesh editable = BSLKClubGeometry.ReadableCopy(model);
+        Check(!model.isReadable && editable.isReadable && editable.vertexCount == model.vertexCount && BSLKClubGeometry.Editable(editable),
+            "Model without Read/Write yields an editable copy for club operations");
+        Object.DestroyImmediate(editable);
+        var result = BSLKClubOptimizer.Create(root, new BSLKClubOptimizer.Options { optimizeTextures = false });
+        Mesh copy = result.avatar.transform.Find("Part").GetComponent<MeshFilter>().sharedMesh;
+        Check(copy != model && BSLKClubGeometry.TriangleCount(copy) == 2 && !copy.isReadable && AssetDatabase.GetAssetPath(copy).StartsWith(result.folder),
+            "Club copy of the model is intact and keeps Read/Write off like the source");
+        Check(File.ReadAllText(path + ".meta") == meta && !model.isReadable, "Source model and importer unchanged");
+        Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
+    }
+
+    // The window simplifies several scene meshes and restores them all, through the remembered originals.
+    private static void SimplifyAndRestore()
+    {
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+        var window = ScriptableObject.CreateInstance<BSLKOptimizerWindow>();
+        var root = new GameObject("SimplifyScene");
+        var meshes = new List<Mesh>();
+        var renderers = new List<MeshRenderer>();
+        for (int i = 0; i < 2; i++)
+        {
+            GameObject go = MeshObject(root, "Part" + i, MakeMaterial("SimplifyMat" + i));
+            Mesh grid = MakeGrid(20);
+            AssetDatabase.CreateAsset(grid, fixture + "/grid" + i + ".asset");
+            go.GetComponent<MeshFilter>().sharedMesh = grid;
+            meshes.Add(grid);
+            renderers.Add(go.GetComponent<MeshRenderer>());
+            typeof(BSLKOptimizerWindow).GetField("simplifyTarget", flags).SetValue(window, go.GetComponent<MeshRenderer>());
+            typeof(BSLKOptimizerWindow).GetMethod("Simplify", flags).Invoke(window, null);
+        }
+        var found = (List<Renderer>)typeof(BSLKOptimizerWindow).GetMethod("FindSimplified", flags).Invoke(null, null);
+        Check(found.Count == 2 && renderers.All(r => r.GetComponent<MeshFilter>().sharedMesh != meshes[renderers.IndexOf(r)]) &&
+            AssetDatabase.GetAssetPath(renderers[0].GetComponent<MeshFilter>().sharedMesh).StartsWith(BSLKClubOptimizer.OutputRoot + "/Simplified/"),
+            "Two scene meshes simplified into new assets");
+        typeof(BSLKOptimizerWindow).GetMethod("RestoreAll", flags).Invoke(window, null);
+        Check(renderers.All(r => r.GetComponent<MeshFilter>().sharedMesh == meshes[renderers.IndexOf(r)]) && meshes.All(m => BSLKClubGeometry.TriangleCount(m) == 800),
+            "All simplified meshes restored to their unchanged originals");
+        // Automatic plan toward a triangle budget, then restore everything.
+        typeof(BSLKOptimizerWindow).GetField("avatar", flags).SetValue(window, root);
+        typeof(BSLKOptimizerWindow).GetField("autoBudget", flags).SetValue(window, 1000);
+        object[] args = { root, 1000, null };
+        var plan = (System.Collections.IList)typeof(BSLKOptimizerWindow).GetMethod("Plan", flags).Invoke(window, args);
+        typeof(BSLKOptimizerWindow).GetField("autoPlan", flags).SetValue(window, plan);
+        typeof(BSLKOptimizerWindow).GetMethod("ApplyPlan", flags).Invoke(window, null);
+        int total = renderers.Sum(r => BSLKClubGeometry.TriangleCount(r.GetComponent<MeshFilter>().sharedMesh));
+        Check(plan.Count == 2 && total < 1600 * 0.8f, "Automatic plan reduced 1600 triangles toward 1000: " + total + " (" + args[2] + ")");
+        typeof(BSLKOptimizerWindow).GetMethod("RestoreAll", flags).Invoke(window, null);
+        Check(renderers.All(r => r.GetComponent<MeshFilter>().sharedMesh == meshes[renderers.IndexOf(r)]), "Automatic simplification restored");
+
+        // Vertices skinned to protected bones (head, hands) are never collapsed.
+        Mesh skinned = MakeGrid(10);
+        skinned.boneWeights = skinned.vertices.Select(_ => new BoneWeight { boneIndex0 = 0, weight0 = 1 }).ToArray();
+        skinned.bindposes = new[] { Matrix4x4.identity };
+        Check(BSLKClubGeometry.TriangleCount(BSLKClubGeometry.Simplify(skinned, 0.3f, false, new[] { 0 })) == 200 &&
+            BSLKClubGeometry.TriangleCount(BSLKClubGeometry.Simplify(skinned, 0.3f, false)) < 200, "Protected bones keep their geometry");
+        Object.DestroyImmediate(root); Object.DestroyImmediate(window);
+    }
+
+    private static Mesh MakeGrid(int size)
+    {
+        var vertices = new List<Vector3>();
+        var triangles = new List<int>();
+        for (int y = 0; y <= size; y++) for (int x = 0; x <= size; x++) vertices.Add(new Vector3(x, Mathf.Sin(x * 0.3f) * 0.2f, y));
+        for (int y = 0; y < size; y++) for (int x = 0; x < size; x++)
+        {
+            int i = y * (size + 1) + x;
+            triangles.AddRange(new[] { i, i + size + 1, i + 1, i + 1, i + size + 1, i + size + 2 });
+        }
+        var mesh = new Mesh { name = "Grid" };
+        mesh.SetVertices(vertices); mesh.SetTriangles(triangles, 0); mesh.RecalculateNormals();
+        return mesh;
+    }
+
+    private static Texture2D MakeTexture(string name, bool checker, bool darkNoise = false, byte alpha = 255)
     {
         var texture = new Texture2D(1024, 1024, TextureFormat.RGBA32, false);
         Color32[] pixels = new Color32[1024 * 1024];
@@ -314,7 +418,7 @@ public static class BSLKClubRegression
         {
             byte v = (byte)random.Next(0, 41);
             pixels[y * 1024 + x] = darkNoise ? new Color32(v, v, v, 255) :
-                checker ? ((x + y) % 2 == 0 ? new Color32(0, 0, 0, 255) : new Color32(255, 255, 255, 255)) : new Color32(128, 64, 32, 255);
+                checker ? ((x + y) % 2 == 0 ? new Color32(0, 0, 0, 255) : new Color32(255, 255, 255, 255)) : new Color32(128, 64, 32, alpha);
         }
         texture.SetPixels32(pixels); texture.Apply();
         string path = fixture + "/" + name + ".png";
@@ -344,6 +448,7 @@ public static class BSLKClubRegression
         GameObject root = new GameObject("Textures");
         Texture2D flat = MakeTexture("Flat", false), detail = MakeTexture("Detail", true), protect = MakeTexture("Protected", false);
         Texture2D dark = MakeTexture("DarkDetail", false, true);
+        Texture2D translucent = MakeTexture("Translucent", false, false, 128);
         Color32 sample = BSLKClubTextures.Readback(flat, 1024, 1024)[0];
         Check(Math.Abs(sample.r - 128) <= 2 && Math.Abs(sample.g - 64) <= 2 && Math.Abs(sample.b - 32) <= 2,
             "Readback compares sRGB values in a Linear project: " + sample);
@@ -351,6 +456,7 @@ public static class BSLKClubRegression
         MeshObject(root, "Detail", MakeMaterial("DetailMat", detail));
         MeshObject(root, "Protected", MakeMaterial("ProtectedMat", protect));
         MeshObject(root, "Dark", MakeMaterial("DarkMat", dark));
+        MeshObject(root, "Translucent", MakeMaterial("TranslucentMat", translucent));
         var options = new BSLKClubOptimizer.Options { minimumTextureSize = 256 };
         options.protectedTextures.Add(protect);
         string originalMeta = File.ReadAllText(AssetDatabase.GetAssetPath(flat) + ".meta");
@@ -363,6 +469,9 @@ public static class BSLKClubRegression
         Check(protectCopy.width == 1024, "Protected texture retains resolution");
         Texture darkCopy = result.avatar.transform.Find("Dark").GetComponent<MeshRenderer>().sharedMaterial.mainTexture;
         Check(darkCopy.width == 1024, "Dark detail is judged perceptually and is not downscaled");
+        Texture2D translucentCopy = (Texture2D)result.avatar.transform.Find("Translucent").GetComponent<MeshRenderer>().sharedMaterial.mainTexture;
+        Check(((Texture2D)flatCopy).format == TextureFormat.DXT1 && translucentCopy.format != TextureFormat.DXT1,
+            "Opaque texture drops its unused alpha (DXT1); a texture with alpha keeps it (" + ((Texture2D)flatCopy).format + ", " + translucentCopy.format + ")");
         Check(flat.width == 1024 && File.ReadAllText(AssetDatabase.GetAssetPath(flat) + ".meta") == originalMeta, "Source texture importer unchanged");
         Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
     }

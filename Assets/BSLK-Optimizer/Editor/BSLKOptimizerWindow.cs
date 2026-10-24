@@ -21,6 +21,7 @@ namespace BSLK.Optimizer
         [SerializeField] private bool mergeMeshes = true;
         [SerializeField] private bool removeUnusedShapesAndBones = true;
         [SerializeField] private bool keepMmdShapes = true;
+        [SerializeField] private bool removeHiddenBody = true;
         [SerializeField] private List<Texture> protectedTextures = new List<Texture>();
         [SerializeField] private List<string> stripColliders = new List<string>();
         [SerializeField] private string report = "";
@@ -38,6 +39,11 @@ namespace BSLK.Optimizer
         private bool showGeometryOptions;
         private List<BSLKClubInsights.Section> insights;
         private List<BSLKClubInsights.PhysBoneEntry> physBones;
+        private List<Renderer> simplified;
+        private List<PlanEntry> autoPlan;
+        private string autoPlanNote = "";
+        [SerializeField] private int autoBudget = (int)BSLKClubOptimizer.TriangleLimit;
+        [SerializeField] private bool autoProtectFaceHands = true;
         private bool updating;
         private string updateStatus = "";
 
@@ -176,6 +182,7 @@ namespace BSLK.Optimizer
                 removeUnusedShapesAndBones = EditorGUILayout.ToggleLeft("Удалять неиспользуемые blend shapes и привязки костей", removeUnusedShapesAndBones);
                 using (new EditorGUI.DisabledScope(!removeUnusedShapesAndBones))
                     keepMmdShapes = EditorGUILayout.ToggleLeft("Сохранять MMD-ключи лица", keepMmdShapes);
+                removeHiddenBody = EditorGUILayout.ToggleLeft("Вырезать тело под одеждой, если после удаления выключенного всё ещё больше 500K", removeHiddenBody);
                 GUILayout.Label("Лицо, visemes, всё, на что ссылаются компоненты (VRCFury и др.), рендереры с анимацией материалов или включения и объекты под вложенными Animator не объединяются.", small);
                 EditorGUI.indentLevel--;
             }
@@ -223,6 +230,7 @@ namespace BSLK.Optimizer
                 if (GUILayout.Button("Показать исходник", GUILayout.Height(26))) ShowComparison(false);
                 if (GUILayout.Button("Показать " + BSLKClubOptimizer.Suffix, GUILayout.Height(26))) ShowComparison(true);
                 EditorGUILayout.EndHorizontal();
+                if (GUILayout.Button("Открыть сравнение рядом", GUILayout.Height(26))) BSLKCompareWindow.Open(lastSource, lastResult);
                 GUILayout.Label("Кнопки только переключают видимость в сцене; действие отменяется через Undo. Отчёт и лимиты — на вкладке «Лимиты».", small);
                 EndCard();
             }
@@ -271,6 +279,7 @@ namespace BSLK.Optimizer
                     EditorUtility.DisplayDialog("BSLK Optimizer", "Build-плагины будут запущены на временной копии, как при загрузке. VRCFury при этом сохраняет все несохранённые изменения ассетов проекта. Продолжить?", "Проверить", "Отмена"))
                     EditorApplication.delayCall += BuildCheck;
             EndCard();
+            AutoSimplifyTool();
             SimplifyTool();
         }
 
@@ -322,56 +331,279 @@ namespace BSLK.Optimizer
             EndCard();
         }
 
+        private bool InResult(Renderer renderer)
+        {
+            return lastResult != null && renderer != null && renderer.transform.IsChildOf(lastResult.transform);
+        }
+
+        // Works on any renderer in the scene. The simplified mesh is always a new asset whose .meta
+        // remembers the original mesh, so every simplified object can be restored later, even after
+        // restarting Unity. The original mesh file is never edited.
         private void SimplifyTool()
         {
             BeginCard("Упрощение геометрии (вручную)", Orange);
-            if (lastResult == null)
-            {
-                GUILayout.Label("Доступно после создания клубной версии: упрощается только меш в копии " + BSLKClubOptimizer.Suffix + ".", small);
-                EndCard();
-                return;
-            }
-            Renderer target = (Renderer)EditorGUILayout.ObjectField("Меш в копии", simplifyTarget, typeof(Renderer), true);
+            Renderer target = (Renderer)EditorGUILayout.ObjectField("Меш в сцене", simplifyTarget, typeof(Renderer), true);
             if (target != simplifyTarget) { simplifyTarget = target; simplifyOriginal = null; simplifyResult = null; }
-            if (simplifyTarget != null && !simplifyTarget.transform.IsChildOf(lastResult.transform))
+            if (simplifyTarget != null && EditorUtility.IsPersistent(simplifyTarget))
             {
-                EditorGUILayout.HelpBox("Выберите рендерер внутри созданной копии " + lastResult.name + ". Исходник не упрощается.", MessageType.Warning);
-                EndCard();
-                return;
+                EditorGUILayout.HelpBox("Выберите объект в сцене, а не prefab в папке проекта.", MessageType.Warning);
+                simplifyTarget = null;
             }
+            if (simplifyTarget != null && !InResult(simplifyTarget))
+                GUILayout.Label("Объект в сцене получит новый упрощённый меш; файл исходного меша не меняется. Все упрощённые объекты перечислены ниже, их можно вернуть по одному или все сразу.", small);
             simplifyRatio = EditorGUILayout.Slider("Оставить треугольников, %", simplifyRatio * 100, 10, 95) / 100;
             simplifyLockShapes = EditorGUILayout.ToggleLeft("Не трогать вершины blend shapes (лицо, мимика, shrink)", simplifyLockShapes);
             Mesh current = simplifyTarget != null ? BSLKClubGeometry.MeshOf(simplifyTarget) : null;
-            if (current != null) GUILayout.Label("Сейчас треугольников: " + BSLKClubGeometry.TriangleCount(current), small);
+            if (current != null)
+            {
+                Mesh original = OriginalOf(current);
+                GUILayout.Label("Сейчас треугольников: " + BSLKClubGeometry.TriangleCount(current) +
+                    (original != null ? " (оригинал " + BSLKClubGeometry.TriangleCount(original) + ")" : ""), small);
+            }
             using (new EditorGUI.DisabledScope(current == null))
                 if (GUILayout.Button("Упростить", GUILayout.Height(26))) Simplify();
-            if (simplifyOriginal != null && simplifyResult != null)
+            if (simplifyTarget != null && simplifyOriginal != null && simplifyResult != null)
             {
-                GUILayout.Label("Оригинал " + BSLKClubGeometry.TriangleCount(simplifyOriginal) + " → упрощённый " + BSLKClubGeometry.TriangleCount(simplifyResult), EditorStyles.boldLabel);
                 EditorGUILayout.BeginHorizontal();
-                if (GUILayout.Button("Показать оригинал")) SetMesh(simplifyOriginal);
-                if (GUILayout.Button("Показать упрощённый")) SetMesh(simplifyResult);
+                if (GUILayout.Button("Показать оригинал")) { SetMesh(simplifyTarget, simplifyOriginal); simplified = null; }
+                if (GUILayout.Button("Показать упрощённый")) { SetMesh(simplifyTarget, simplifyResult); simplified = null; }
                 EditorGUILayout.EndHorizontal();
-                if (GUILayout.Button("Сохранить текущий вариант в prefab")) SaveSimplified();
+                if (InResult(simplifyTarget) && GUILayout.Button("Сохранить текущий вариант в prefab " + BSLKClubOptimizer.Suffix)) SaveSimplified();
             }
+
+            if (simplified == null) simplified = FindSimplified();
+            GUILayout.Space(6);
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("Упрощённые меши в сцене: " + simplified.Count, EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Обновить", GUILayout.Width(80))) simplified = FindSimplified();
+            EditorGUILayout.EndHorizontal();
+            Renderer restore = null;
+            foreach (Renderer renderer in simplified)
+            {
+                if (renderer == null) continue;
+                Mesh mesh = BSLKClubGeometry.MeshOf(renderer), original = OriginalOf(mesh);
+                if (original == null) continue;
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Label(ObjectPath(renderer), EditorStyles.miniLabel, GUILayout.MinWidth(120));
+                GUILayout.Label(BSLKClubGeometry.TriangleCount(original) + " → " + BSLKClubGeometry.TriangleCount(mesh), GUILayout.Width(110));
+                if (GUILayout.Button("Вернуть", GUILayout.Width(70))) restore = renderer;
+                if (GUILayout.Button("Выбрать", GUILayout.Width(70))) Select(renderer.gameObject);
+                EditorGUILayout.EndHorizontal();
+            }
+            if (restore != null) { SetMesh(restore, OriginalOf(BSLKClubGeometry.MeshOf(restore))); simplified = null; }
+            using (new EditorGUI.DisabledScope(simplified.Count == 0))
+                if (GUILayout.Button("Вернуть все оригиналы", GUILayout.Height(24))) RestoreAll();
             EndCard();
+        }
+
+        private static string ObjectPath(Component component)
+        {
+            Transform root = component.transform.root;
+            return component.transform == root ? root.name : root.name + "/" + AnimationUtility.CalculateTransformPath(component.transform, root);
         }
 
         // ---- Actions
 
+        private const string OriginalMarker = "bslk-original:";
+
+        private static Mesh OriginalOf(Mesh mesh)
+        {
+            if (mesh == null) return null;
+            AssetImporter importer = AssetImporter.GetAtPath(AssetDatabase.GetAssetPath(mesh));
+            if (importer == null || importer.userData == null || !importer.userData.StartsWith(OriginalMarker, StringComparison.Ordinal)) return null;
+            return GlobalObjectId.TryParse(importer.userData.Substring(OriginalMarker.Length), out GlobalObjectId id)
+                ? GlobalObjectId.GlobalObjectIdentifierToObjectSlow(id) as Mesh : null;
+        }
+
+        private static List<Renderer> FindSimplified()
+        {
+            var result = new List<Renderer>();
+            for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (!scene.isLoaded) continue;
+                foreach (GameObject root in scene.GetRootGameObjects())
+                    foreach (Renderer renderer in root.GetComponentsInChildren<Renderer>(true))
+                        if ((renderer is SkinnedMeshRenderer || renderer is MeshRenderer) && OriginalOf(BSLKClubGeometry.MeshOf(renderer)) != null) result.Add(renderer);
+            }
+            return result;
+        }
+
+        private void RestoreAll()
+        {
+            Undo.SetCurrentGroupName("Вернуть оригинальные меши");
+            int group = Undo.GetCurrentGroup();
+            foreach (Renderer renderer in FindSimplified()) SetMesh(renderer, OriginalOf(BSLKClubGeometry.MeshOf(renderer)));
+            Undo.CollapseUndoOperations(group);
+            simplified = null;
+            simplifyOriginal = null; simplifyResult = null;
+        }
+
         private void Simplify()
         {
             Mesh current = BSLKClubGeometry.MeshOf(simplifyTarget);
-            if (simplifyOriginal == null || (current != simplifyOriginal && current != simplifyResult)) simplifyOriginal = current;
+            simplifyOriginal = OriginalOf(current) ?? current;
+            try { simplifyResult = SimplifyRenderer(simplifyTarget, simplifyRatio, null); }
+            catch (Exception exception) { EditorUtility.DisplayDialog("BSLK Optimizer", "Не удалось упростить: " + exception.Message, "OK"); }
+        }
+
+        // Always simplifies from the true original, never from an already simplified mesh, and records
+        // that original in the new asset's .meta so it can be restored later.
+        private Mesh SimplifyRenderer(Renderer renderer, float ratio, ICollection<int> protectedBones)
+        {
+            Mesh current = BSLKClubGeometry.MeshOf(renderer);
+            Mesh original = OriginalOf(current) ?? current;
+            string folder = InResult(renderer) ? ResultFolder() : SimplifiedFolder();
+            Mesh mesh = BSLKClubGeometry.Simplify(original, ratio, simplifyLockShapes, protectedBones);
+            string path = AssetDatabase.GenerateUniqueAssetPath(folder + "/" + mesh.name + ".asset");
+            AssetDatabase.CreateAsset(mesh, path);
+            AssetImporter importer = AssetImporter.GetAtPath(path);
+            importer.userData = OriginalMarker + GlobalObjectId.GetGlobalObjectIdSlow(original);
+            importer.SaveAndReimport();
+            Mesh saved = AssetDatabase.LoadAssetAtPath<Mesh>(path);
+            SetMesh(renderer, saved);
+            simplified = null;
+            return saved;
+        }
+
+        // ---- Automatic simplification toward the triangle limit
+
+        internal sealed class PlanEntry
+        {
+            public Renderer renderer;
+            public int triangles, planned;
+        }
+
+        private GameObject AutoTarget { get { return lastResult != null ? lastResult : avatar; } }
+
+        private void AutoSimplifyTool()
+        {
+            BeginCard("Автоупрощение до лимита треугольников", Blue);
+            GameObject target = AutoTarget;
+            if (target == null)
+            {
+                GUILayout.Label("Выберите аватар на вкладке «Создание».", small);
+                EndCard();
+                return;
+            }
+            GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: в сцене получит новые меши, файлы моделей не меняются)"), small);
+            autoBudget = EditorGUILayout.IntField("Цель, треугольников", autoBudget);
+            autoProtectFaceHands = EditorGUILayout.ToggleLeft("Не упрощать лицо, голову и кисти рук", autoProtectFaceHands);
+            if (GUILayout.Button("Рассчитать план", GUILayout.Height(24))) autoPlan = Plan(target, autoBudget, out autoPlanNote);
+            if (autoPlan != null)
+            {
+                GUILayout.Label(autoPlanNote, wrap);
+                foreach (PlanEntry entry in autoPlan)
+                {
+                    if (entry.renderer == null) continue;
+                    EditorGUILayout.BeginHorizontal();
+                    GUILayout.Label(ObjectPath(entry.renderer), EditorStyles.miniLabel, GUILayout.MinWidth(120));
+                    GUILayout.Label(entry.triangles + " → ~" + entry.planned, GUILayout.Width(130));
+                    if (GUILayout.Button("Выбрать", GUILayout.Width(70))) Select(entry.renderer.gameObject);
+                    EditorGUILayout.EndHorizontal();
+                }
+                using (new EditorGUI.DisabledScope(autoPlan.Count == 0))
+                    if (ColoredButton("Применить план", Blue)) EditorApplication.delayCall += ApplyPlan;
+                GUILayout.Label("Результат можно вернуть кнопкой «Вернуть все оригиналы» в карточке ниже.", small);
+            }
+            EndCard();
+        }
+
+        // Every eligible mesh gives up the same share of its triangles; tiny meshes and the face mesh
+        // used for visemes are left alone. Each mesh keeps at least a quarter of its triangles.
+        private List<PlanEntry> Plan(GameObject target, int budget, out string note)
+        {
+            var renderers = target.GetComponentsInChildren<Renderer>(true)
+                .Where(r => r.gameObject.activeInHierarchy && (r is SkinnedMeshRenderer || r is MeshRenderer) && BSLKClubGeometry.MeshOf(r) != null).ToList();
+            long total = renderers.Sum(r => (long)BSLKClubGeometry.TriangleCount(OriginalOf(BSLKClubGeometry.MeshOf(r)) ?? BSLKClubGeometry.MeshOf(r)));
+            var face = new HashSet<Renderer>();
+            Component descriptor = target.GetComponents<Component>().FirstOrDefault(x => x != null && x.GetType().Name == "VRCAvatarDescriptor");
+            if (descriptor != null)
+                using (var serialized = new SerializedObject(descriptor))
+                    foreach (string property in new[] { "VisemeSkinnedMesh", "customEyeLookSettings.eyelidsSkinnedMesh" })
+                        if (serialized.FindProperty(property)?.objectReferenceValue is Renderer renderer) face.Add(renderer);
+            // Meshes under 0.5% of the avatar (at least 100 triangles) give too little to be worth the risk.
+            long minimum = Math.Max(100, total / 200);
+            var eligible = renderers.Where(r => !face.Contains(r) && BSLKClubGeometry.TriangleCount(OriginalOf(BSLKClubGeometry.MeshOf(r)) ?? BSLKClubGeometry.MeshOf(r)) >= minimum).ToList();
+            long eligibleTotal = eligible.Sum(r => (long)BSLKClubGeometry.TriangleCount(OriginalOf(BSLKClubGeometry.MeshOf(r)) ?? BSLKClubGeometry.MeshOf(r)));
+            long excess = total - budget;
+            var plan = new List<PlanEntry>();
+            if (excess <= 0) { note = "Сейчас " + total + " треугольников — уже в пределах цели " + budget + "."; return plan; }
+            if (eligibleTotal == 0) { note = "Нет мешей, которые можно упростить (лицо и мелкие меши не трогаются)."; return plan; }
+            float keep = Mathf.Max(0.25f, 1f - (float)excess / eligibleTotal);
+            foreach (Renderer renderer in eligible.OrderByDescending(r => BSLKClubGeometry.TriangleCount(BSLKClubGeometry.MeshOf(r))))
+            {
+                int triangles = BSLKClubGeometry.TriangleCount(OriginalOf(BSLKClubGeometry.MeshOf(renderer)) ?? BSLKClubGeometry.MeshOf(renderer));
+                plan.Add(new PlanEntry { renderer = renderer, triangles = triangles, planned = Mathf.RoundToInt(triangles * keep) });
+            }
+            long after = total - eligibleTotal + plan.Sum(e => (long)e.planned);
+            note = "Сейчас " + total + ", цель " + budget + ". Оставить ~" + Mathf.RoundToInt(keep * 100) + "% треугольников у " + plan.Count + " мешей → ~" + after + "." +
+                (after > budget ? " Даже так цель не достигается: остальное — лицо, мелкие меши и защищённые участки." : "") +
+                " Края, швы UV" + (simplifyLockShapes ? ", вершины blend shapes" : "") + (autoProtectFaceHands ? ", лицо и кисти" : "") + " не упрощаются, поэтому итог может быть выше плана.";
+            return plan;
+        }
+
+        private void ApplyPlan()
+        {
+            if (autoPlan == null) return;
+            Undo.SetCurrentGroupName("Автоупрощение");
+            int group = Undo.GetCurrentGroup();
             try
             {
-                string folder = ResultFolder();
-                Mesh mesh = BSLKClubGeometry.Simplify(simplifyOriginal, simplifyRatio, simplifyLockShapes);
-                AssetDatabase.CreateAsset(mesh, AssetDatabase.GenerateUniqueAssetPath(folder + "/" + mesh.name + ".asset"));
-                simplifyResult = mesh;
-                SetMesh(mesh);
+                for (int i = 0; i < autoPlan.Count; i++)
+                {
+                    PlanEntry entry = autoPlan[i];
+                    if (entry.renderer == null || entry.triangles == 0) continue;
+                    EditorUtility.DisplayProgressBar("BSLK Optimizer", "Упрощение " + entry.renderer.name, (float)i / autoPlan.Count);
+                    SimplifyRenderer(entry.renderer, (float)entry.planned / entry.triangles, autoProtectFaceHands ? ProtectedBones(entry.renderer) : null);
+                }
             }
-            catch (Exception exception) { EditorUtility.DisplayDialog("BSLK Optimizer", "Не удалось упростить: " + exception.Message, "OK"); }
+            catch (Exception exception) { EditorUtility.DisplayDialog("BSLK Optimizer", "Автоупрощение остановлено: " + exception.Message, "OK"); }
+            finally { EditorUtility.ClearProgressBar(); }
+            Undo.CollapseUndoOperations(group);
+            GameObject target = AutoTarget;
+            long total = target.GetComponentsInChildren<Renderer>(true).Where(r => r.gameObject.activeInHierarchy && BSLKClubGeometry.MeshOf(r) != null)
+                .Sum(r => (long)BSLKClubGeometry.TriangleCount(BSLKClubGeometry.MeshOf(r)));
+            autoPlanNote = "Применено. Теперь треугольников: " + total + " / " + autoBudget + ".";
+            autoPlan = null;
+            simplified = null;
+            insights = BSLKClubInsights.Collect(target);
+            Repaint();
+        }
+
+        // Head, neck, jaw, eyes and all hand/finger bones of a humanoid rig, plus everything under the head.
+        private static HashSet<int> ProtectedBones(Renderer renderer)
+        {
+            var result = new HashSet<int>();
+            var skinned = renderer as SkinnedMeshRenderer;
+            Animator animator = renderer.GetComponentInParent<Animator>();
+            if (skinned == null || animator == null || !animator.isHuman) return result;
+            var protectedTransforms = new HashSet<Transform>();
+            foreach (HumanBodyBones bone in Enum.GetValues(typeof(HumanBodyBones)))
+            {
+                if (bone == HumanBodyBones.LastBone) continue;
+                string name = bone.ToString();
+                if (bone != HumanBodyBones.Head && bone != HumanBodyBones.Neck && bone != HumanBodyBones.Jaw && !name.Contains("Eye") && !name.Contains("Hand") &&
+                    !name.Contains("Thumb") && !name.Contains("Index") && !name.Contains("Middle") && !name.Contains("Ring") && !name.Contains("Little")) continue;
+                Transform transform = animator.GetBoneTransform(bone);
+                if (transform == null) continue;
+                protectedTransforms.Add(transform);
+                if (bone == HumanBodyBones.Head || bone == HumanBodyBones.LeftHand || bone == HumanBodyBones.RightHand)
+                    foreach (Transform child in transform.GetComponentsInChildren<Transform>(true)) protectedTransforms.Add(child);
+            }
+            Transform[] bones = skinned.bones;
+            for (int i = 0; i < bones.Length; i++) if (bones[i] != null && protectedTransforms.Contains(bones[i])) result.Add(i);
+            return result;
+        }
+
+        // Simplified meshes of non-generated objects live next to the club results, never beside the source.
+        private static string SimplifiedFolder()
+        {
+            if (!AssetDatabase.IsValidFolder(BSLKClubOptimizer.OutputRoot)) AssetDatabase.CreateFolder("Assets", Path.GetFileName(BSLKClubOptimizer.OutputRoot));
+            string folder = BSLKClubOptimizer.OutputRoot + "/Simplified";
+            if (!AssetDatabase.IsValidFolder(folder)) AssetDatabase.CreateFolder(BSLKClubOptimizer.OutputRoot, "Simplified");
+            return folder;
         }
 
         private string ResultFolder()
@@ -382,11 +614,13 @@ namespace BSLK.Optimizer
             return Path.GetDirectoryName(prefab).Replace('\\', '/');
         }
 
-        private void SetMesh(Mesh mesh)
+        private static void SetMesh(Renderer renderer, Mesh mesh)
         {
-            Object holder = simplifyTarget is SkinnedMeshRenderer ? (Object)simplifyTarget : simplifyTarget.GetComponent<MeshFilter>();
+            if (renderer == null || mesh == null) return;
+            Object holder = renderer is SkinnedMeshRenderer ? (Object)renderer : renderer.GetComponent<MeshFilter>();
             Undo.RecordObject(holder, "Упрощение геометрии");
-            BSLKClubGeometry.Assign(simplifyTarget, mesh);
+            BSLKClubGeometry.Assign(renderer, mesh);
+            if (PrefabUtility.IsPartOfPrefabInstance(holder)) PrefabUtility.RecordPrefabInstancePropertyModifications(holder);
         }
 
         private void SaveSimplified()
@@ -424,7 +658,7 @@ namespace BSLK.Optimizer
                 singleOutfit = singleOutfit, optimizeTextures = optimizeTextures,
                 limitParticles = limitParticles, minimumTextureSize = minimumTextureSize, textureError = textureError,
                 mergeTextures = mergeTextures, mergeMaterials = mergeMaterials, mergeMeshes = mergeMeshes,
-                removeUnusedShapesAndBones = removeUnusedShapesAndBones, keepMmdShapes = keepMmdShapes
+                removeUnusedShapesAndBones = removeUnusedShapesAndBones, keepMmdShapes = keepMmdShapes, removeHiddenBody = removeHiddenBody
             };
             foreach (Texture texture in protectedTextures) if (texture != null) options.protectedTextures.Add(texture);
             options.stripColliders.UnionWith(stripColliders);
@@ -465,5 +699,146 @@ namespace BSLK.Optimizer
             }
         }
 
+    }
+
+    // Source and club copy side by side with one shared orbit camera. Both are rendered from
+    // temporary clones inside preview scenes, so the scene objects themselves are not touched.
+    public class BSLKCompareWindow : EditorWindow
+    {
+        [SerializeField] private GameObject left, right;
+        private PreviewRenderUtility leftPreview, rightPreview;
+        private GameObject leftClone, rightClone;
+        private Vector2 orbit = new Vector2(180, 5);
+        private Vector3 pivot;
+        private float distance = 3, size = 1;
+        private Transform head;
+
+        [MenuItem("BSLK-Optimizer/Сравнение исходника и копии")]
+        private static void OpenEmpty() { Open(null, null); }
+
+        internal static void Open(GameObject source, GameObject club)
+        {
+            var window = GetWindow<BSLKCompareWindow>("BSLK • Сравнение");
+            window.minSize = new Vector2(640, 420);
+            window.left = source;
+            window.right = club;
+            window.Setup();
+        }
+
+        private void OnEnable() { if (left != null || right != null) Setup(); }
+        private void OnDisable() { Cleanup(); }
+
+        private void Cleanup()
+        {
+            if (leftPreview != null) leftPreview.Cleanup();
+            if (rightPreview != null) rightPreview.Cleanup();
+            leftPreview = rightPreview = null;
+            if (leftClone != null) DestroyImmediate(leftClone);
+            if (rightClone != null) DestroyImmediate(rightClone);
+        }
+
+        private void Setup()
+        {
+            Cleanup();
+            leftPreview = MakePreview(left, out leftClone);
+            rightPreview = MakePreview(right, out rightClone);
+            GameObject reference = leftClone != null ? leftClone : rightClone;
+            Bounds bounds = new Bounds(Vector3.zero, Vector3.one);
+            if (reference != null)
+            {
+                Renderer[] renderers = reference.GetComponentsInChildren<Renderer>();
+                if (renderers.Length > 0)
+                {
+                    bounds = renderers[0].bounds;
+                    foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+                }
+                Animator animator = reference.GetComponent<Animator>();
+                head = animator != null && animator.isHuman ? animator.GetBoneTransform(HumanBodyBones.Head) : null;
+            }
+            size = Mathf.Max(0.1f, bounds.size.magnitude);
+            // Fit the whole bounds into the 30° view with some margin.
+            View(bounds.center, size * 2.2f, 180);
+        }
+
+        private static PreviewRenderUtility MakePreview(GameObject source, out GameObject clone)
+        {
+            clone = null;
+            var preview = new PreviewRenderUtility();
+            preview.camera.fieldOfView = 30;
+            preview.camera.nearClipPlane = 0.01f;
+            preview.camera.farClipPlane = 1000;
+            preview.camera.clearFlags = CameraClearFlags.SolidColor;
+            preview.camera.backgroundColor = new Color32(40, 42, 48, 255);
+            preview.lights[0].intensity = 1.1f;
+            preview.lights[0].transform.rotation = Quaternion.Euler(30, 150, 0);
+            preview.lights[1].intensity = 0.6f;
+            preview.ambientColor = new Color(0.35f, 0.35f, 0.38f);
+            if (source == null) return preview;
+            clone = Instantiate(source);
+            clone.hideFlags = HideFlags.HideAndDontSave;
+            clone.transform.SetPositionAndRotation(source.transform.position, source.transform.rotation);
+            clone.SetActive(true);
+            preview.AddSingleGO(clone);
+            return preview;
+        }
+
+        private void View(Vector3 center, float newDistance, float yaw)
+        {
+            pivot = center;
+            distance = newDistance;
+            orbit = new Vector2(yaw, 5);
+            Repaint();
+        }
+
+        private void OnGUI()
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+            GameObject newLeft = (GameObject)EditorGUILayout.ObjectField(left, typeof(GameObject), true, GUILayout.Width(200));
+            GameObject newRight = (GameObject)EditorGUILayout.ObjectField(right, typeof(GameObject), true, GUILayout.Width(200));
+            if (newLeft != left || newRight != right) { left = newLeft; right = newRight; Setup(); }
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Спереди", EditorStyles.toolbarButton)) View(pivot, distance, 180);
+            if (GUILayout.Button("Сзади", EditorStyles.toolbarButton)) View(pivot, distance, 0);
+            if (GUILayout.Button("Сбоку", EditorStyles.toolbarButton)) View(pivot, distance, 90);
+            using (new EditorGUI.DisabledScope(head == null))
+                if (GUILayout.Button("Лицо", EditorStyles.toolbarButton)) View(head.position + Vector3.up * 0.05f, size * 0.25f, 180);
+            if (GUILayout.Button("Обновить", EditorStyles.toolbarButton)) Setup();
+            EditorGUILayout.EndHorizontal();
+
+            Rect area = GUILayoutUtility.GetRect(position.width, position.height - 22);
+            Rect leftRect = new Rect(area.x, area.y, area.width / 2 - 1, area.height);
+            Rect rightRect = new Rect(area.x + area.width / 2 + 1, area.y, area.width / 2 - 1, area.height);
+            Draw(leftPreview, leftRect, left != null ? "Исходник: " + left.name : "Перетащите исходник в поле слева");
+            Draw(rightPreview, rightRect, right != null ? BSLKClubOptimizer.Suffix + ": " + right.name : "Перетащите копию в поле справа");
+            EditorGUI.DrawRect(new Rect(area.x + area.width / 2 - 1, area.y, 2, area.height), new Color(0, 0, 0, 0.6f));
+            GUI.Label(new Rect(area.x + 8, area.yMax - 20, area.width - 16, 18), "Перетаскивание — вращение, правая кнопка — сдвиг, колесо — масштаб", EditorStyles.miniLabel);
+
+            // One camera for both views: the same drag, pan and zoom apply to source and copy.
+            Event e = Event.current;
+            if (!area.Contains(e.mousePosition)) return;
+            if (e.type == EventType.MouseDrag && e.button == 0) { orbit += new Vector2(e.delta.x, e.delta.y) * 0.4f; orbit.y = Mathf.Clamp(orbit.y, -85, 85); e.Use(); Repaint(); }
+            else if (e.type == EventType.MouseDrag && (e.button == 1 || e.button == 2))
+            {
+                Quaternion rotation = Quaternion.Euler(orbit.y, orbit.x, 0);
+                pivot += (rotation * Vector3.left * e.delta.x + rotation * Vector3.up * e.delta.y) * distance * 0.002f;
+                e.Use(); Repaint();
+            }
+            else if (e.type == EventType.ScrollWheel) { distance = Mathf.Clamp(distance * (1 + e.delta.y * 0.05f), 0.05f, 100); e.Use(); Repaint(); }
+        }
+
+        private void Draw(PreviewRenderUtility preview, Rect rect, string label)
+        {
+            if (preview == null || rect.width < 2 || rect.height < 2) return;
+            if (Event.current.type == EventType.Repaint)
+            {
+                preview.BeginPreview(rect, GUIStyle.none);
+                Quaternion rotation = Quaternion.Euler(orbit.y, orbit.x, 0);
+                preview.camera.transform.position = pivot + rotation * (Vector3.back * distance);
+                preview.camera.transform.rotation = rotation;
+                preview.Render(true);
+                preview.EndAndDrawPreview(rect);
+            }
+            GUI.Label(new Rect(rect.x + 8, rect.y + 6, rect.width - 16, 18), label, EditorStyles.whiteBoldLabel);
+        }
     }
 }

@@ -31,6 +31,7 @@ namespace BSLK.Optimizer
             public bool mergeMeshes = true;
             public bool removeUnusedShapesAndBones = true;
             public bool keepMmdShapes = true;
+            public bool removeHiddenBody = true;
             // PhysBones whose colliders are dropped: "path#index" keys from BSLKClubInsights.PhysBones.
             public readonly HashSet<string> stripColliders = new HashSet<string>();
             public System.Threading.CancellationToken cancellationToken;
@@ -110,13 +111,17 @@ namespace BSLK.Optimizer
                 // Duplicate textures first: materials that differ only by duplicate files then merge too.
                 if (options.mergeTextures) BSLKClubMaterials.MergeDuplicateTextures(context, options.protectedTextures);
                 if (options.mergeMaterials) BSLKClubMaterials.MergeIdenticalMaterials(context);
-                HashSet<Renderer> locked = LockedRenderers(context);
+                HashSet<Renderer> locked = LockedRenderers(context, out HashSet<Renderer> toggleable);
+                // Body under worn clothing is cut only when deleting disabled items was not enough.
+                if (options.removeHiddenBody && TriangleTotal(context.avatar) > TriangleLimit)
+                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => !toggleable.Contains(renderer), mesh => SaveMesh(context, mesh), context.notes);
                 if (options.mergeMeshes) BSLKClubGeometry.MergeClothing(context.avatar, locked, ClubClips(context), mesh => SaveMesh(context, mesh), context.notes);
                 if (options.mergeMaterials)
                     context.notes.Add("Объединено слотов с одинаковым материалом: " + BSLKClubGeometry.MergeDuplicateSlots(context.avatar, locked, mesh => SaveMesh(context, mesh)) + ".");
                 if (options.removeUnusedShapesAndBones) RemoveUnusedShapesAndBones(context, options);
                 StripColliders(context, options.stripColliders);
                 if (options.optimizeTextures) BSLKClubTextures.Optimize(context, options);
+                RestoreReadability(context, source);
 
                 // Persist all data to a prefab; a successful result never relies on transient mesh instances.
                 foreach (string path in context.copiedPaths)
@@ -303,7 +308,8 @@ namespace BSLK.Optimizer
                 foreach (Object asset in AssetDatabase.LoadAllAssetsAtPath(path))
                 {
                     if (!(asset is Mesh) && !(asset is AnimationClip) && !(asset is Material)) continue;
-                    Object copy = Object.Instantiate(asset);
+                    // Meshes become editable copies so merging, shape cleanup and simplification can work.
+                    Object copy = asset is Mesh mesh ? BSLKClubGeometry.ReadableCopy(mesh) : Object.Instantiate(asset);
                     copy.name = asset.name;
                     copy.hideFlags = HideFlags.None;
                     string ext = asset is AnimationClip ? ".anim" : asset is Material ? ".mat" : ".asset";
@@ -347,12 +353,33 @@ namespace BSLK.Optimizer
                 if (copy != null && !(copy is Texture) && !(copy is Mesh)) Remap(copy, map);
         }
 
+        // Result meshes were made readable for editing; a renderer whose source mesh had Read/Write off
+        // gets it off again, so the club avatar does not carry extra CPU mesh memory.
+        private static void RestoreReadability(Context c, GameObject source)
+        {
+            foreach (Renderer renderer in c.avatar.GetComponentsInChildren<Renderer>(true))
+            {
+                Mesh mesh = BSLKClubGeometry.MeshOf(renderer);
+                if (mesh == null || !mesh.isReadable || !c.copiedPaths.Contains(AssetDatabase.GetAssetPath(mesh))) continue;
+                Transform original = source.transform.Find(Relative(renderer.transform, c));
+                Renderer sourceRenderer = original != null ? original.GetComponent<Renderer>() : null;
+                Mesh sourceMesh = sourceRenderer != null ? BSLKClubGeometry.MeshOf(sourceRenderer) : null;
+                if (sourceMesh != null && !sourceMesh.isReadable) BSLKClubGeometry.SetReadable(mesh, false);
+            }
+        }
+
         internal static Mesh SaveMesh(Context c, Mesh mesh)
         {
             string path = AssetDatabase.GenerateUniqueAssetPath(c.folder + "/" + SafeName(mesh.name) + ".asset");
             AssetDatabase.CreateAsset(mesh, path);
             c.copiedPaths.Add(path);
             return mesh;
+        }
+
+        internal static long TriangleTotal(GameObject avatar)
+        {
+            return avatar.GetComponentsInChildren<Renderer>(true).Where(r => r is SkinnedMeshRenderer || r is MeshRenderer)
+                .Select(BSLKClubGeometry.MeshOf).Where(m => m != null).Sum(m => (long)BSLKClubGeometry.TriangleCount(m));
         }
 
         private static ICollection<AnimationClip> ClubClips(Context c)
@@ -363,9 +390,12 @@ namespace BSLK.Optimizer
         // Renderers whose identity, slots or visibility something else depends on: referenced by
         // components (visemes, eyelids, VRCFury actions, particle shapes), animated other than through
         // blend shapes, toggled below their clothing item, or driven by a nested Animator.
-        private static HashSet<Renderer> LockedRenderers(Context c)
+        // `toggleable` collects renderers that can be hidden at runtime (their object or any parent is
+        // switched, or the renderer itself is animated); they must not count as a permanent cover.
+        private static HashSet<Renderer> LockedRenderers(Context c, out HashSet<Renderer> toggleable)
         {
             var locked = new HashSet<Renderer>();
+            toggleable = new HashSet<Renderer>();
             Transform root = c.avatar.transform;
             var animated = new HashSet<string>();
             var toggled = new HashSet<string>();
@@ -392,7 +422,9 @@ namespace BSLK.Optimizer
             }
             foreach (Renderer renderer in c.avatar.GetComponentsInChildren<Renderer>(true))
             {
-                if (animated.Contains(Relative(renderer.transform, c))) { locked.Add(renderer); continue; }
+                if (animated.Contains(Relative(renderer.transform, c))) { locked.Add(renderer); toggleable.Add(renderer); continue; }
+                for (Transform t = renderer.transform; t != null && t != root; t = t.parent)
+                    if (toggled.Contains(Relative(t, c))) { toggleable.Add(renderer); break; }
                 for (Transform t = renderer.transform; t != null && t != root; t = t.parent)
                 {
                     bool topLevel = t.parent == root;

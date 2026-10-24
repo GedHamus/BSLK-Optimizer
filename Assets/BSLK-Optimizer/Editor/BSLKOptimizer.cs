@@ -1518,6 +1518,29 @@ namespace BSLK.Optimizer
             public int Count { get { return positions.Count; } }
         }
 
+        // Instantiate keeps a model's "no Read/Write" flag; a serialized copy carries the data in the
+        // editor and can be marked readable. The source mesh and its importer are not touched.
+        internal static Mesh ReadableCopy(Mesh source)
+        {
+            var copy = new Mesh();
+            EditorUtility.CopySerialized(source, copy);
+            SetReadable(copy, true);
+            copy.name = source.name;
+            return copy;
+        }
+
+        internal static void SetReadable(Mesh mesh, bool readable)
+        {
+            if (mesh.isReadable == readable) return;
+            using (var serialized = new SerializedObject(mesh))
+            {
+                SerializedProperty flag = serialized.FindProperty("m_IsReadable");
+                if (flag == null) return;
+                flag.boolValue = readable;
+                serialized.ApplyModifiedPropertiesWithoutUndo();
+            }
+        }
+
         internal static bool Editable(Mesh mesh)
         {
             if (mesh == null || !mesh.isReadable) return false;
@@ -1857,8 +1880,20 @@ namespace BSLK.Optimizer
         // ---- Simplification: quadric-error half-edge collapse. A vertex only moves onto an existing
         // neighbour, so skin weights, UVs and blend shape deltas stay exact. Index-space boundaries
         // (mesh borders and UV/normal seams) are locked so no cracks open.
-        internal static Mesh Simplify(Mesh source, float ratio, bool lockBlendShapes)
+        // protectedBones: indices into the renderer's bone list; vertices mostly weighted to them stay.
+        internal static Mesh Simplify(Mesh source, float ratio, bool lockBlendShapes, ICollection<int> protectedBones = null)
         {
+            // Source-avatar meshes are often imported without Read/Write: work on an in-memory copy.
+            if (source != null && !source.isReadable)
+            {
+                Mesh copy = ReadableCopy(source);
+                try
+                {
+                    if (!copy.isReadable) throw new InvalidOperationException("Включите Read/Write в настройках импорта модели «" + source.name + "».");
+                    return Simplify(copy, ratio, lockBlendShapes, protectedBones);
+                }
+                finally { Object.DestroyImmediate(copy); }
+            }
             if (!Editable(source)) throw new InvalidOperationException("Меш недоступен для чтения или содержит не только треугольники.");
             Parts parts = Read(source);
             int vertexCount = parts.Count;
@@ -1887,6 +1922,15 @@ namespace BSLK.Optimizer
                 }
             foreach (var edge in edges)
                 if (edge.Value != 2) { locked[(int)(edge.Key >> 32)] = true; locked[(int)(edge.Key & 0xffffffff)] = true; }
+            if (protectedBones != null && protectedBones.Count > 0 && parts.skinned)
+                for (int v = 0, w = 0; v < vertexCount; w += parts.bonesPerVertex[v], v++)
+                {
+                    int dominant = -1;
+                    float best = 0;
+                    for (int k = w; k < w + parts.bonesPerVertex[v]; k++)
+                        if (parts.weights[k].weight > best) { best = parts.weights[k].weight; dominant = parts.weights[k].boneIndex; }
+                    if (protectedBones.Contains(dominant)) locked[v] = true;
+                }
             if (lockBlendShapes)
                 foreach (var frames in parts.shapes.Values)
                     foreach (Frame frame in frames)
@@ -2080,6 +2124,520 @@ namespace BSLK.Optimizer
                     i = smallest;
                 }
                 return top;
+            }
+        }
+    }
+}
+
+namespace BSLK.Optimizer
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using UnityEngine;
+    using UnityEngine.Rendering;
+    using Object = UnityEngine.Object;
+
+    // Removes body triangles that no viewer can see because always-visible clothing covers them.
+    // Works on the club copy only: new meshes are created and saved, the source meshes are never written.
+    internal static class BSLKClubOcclusion
+    {
+        // World-space triangles of one renderer in the current pose.
+        private sealed class Geometry
+        {
+            public Renderer renderer;
+            public Mesh readable;          // the mesh itself or a readable copy we own
+            public bool ownsReadable;
+            public Vector3[] positions;    // world space
+            public int[] triangles;        // all submeshes flattened, 3 per triangle
+            public int[] triangleSubmesh;
+            public int[] welded;           // vertex -> position id (UV/normal seams split vertices)
+            public bool[] moved;           // per welded id: some blend shape moves it
+            public bool candidate, toggleable;
+            public int TriangleCount { get { return triangles.Length / 3; } }
+        }
+
+        // Direction table in a local frame where +z is the outward normal: the normal itself and two rings.
+        // 70° from the normal still finds gaps at clothing edges; flatter rays only add grazing noise.
+        private static readonly Vector3[] Directions = MakeDirections();
+
+        private static Vector3[] MakeDirections()
+        {
+            var result = new List<Vector3> { Vector3.forward };
+            float[] angles = { 35f, 70f };
+            for (int ring = 0; ring < angles.Length; ring++)
+                for (int i = 0; i < 8; i++)
+                {
+                    float polar = angles[ring] * Mathf.Deg2Rad, azimuth = (i + ring * 0.5f) * Mathf.PI / 4f;
+                    result.Add(new Vector3(Mathf.Sin(polar) * Mathf.Cos(azimuth), Mathf.Sin(polar) * Mathf.Sin(azimuth), Mathf.Cos(polar)));
+                }
+            return result.ToArray();
+        }
+
+        internal static int RemoveHiddenTriangles(GameObject avatar, HashSet<Renderer> locked, Func<Renderer, bool> occluderAllowed,
+            Func<Mesh, Mesh> save, List<string> notes)
+        {
+            var geometries = new List<Geometry>();
+            try
+            {
+                Renderer[] renderers = avatar.GetComponentsInChildren<Renderer>(false)
+                    .Where(r => r.enabled && r.gameObject.activeInHierarchy && (r is SkinnedMeshRenderer || r is MeshRenderer)).ToArray();
+                if (renderers.Length < 2)
+                {
+                    notes.Add("Скрытые под одеждой треугольники: нечего удалять (нет подходящих мешей тела и одежды).");
+                    return 0;
+                }
+                Bounds bounds = renderers[0].bounds;
+                foreach (Renderer r in renderers) bounds.Encapsulate(r.bounds);
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    BSLKClubOptimizer.Progress("Скрытые треугольники: поза " + renderers[i].name, 0.1f * i / renderers.Length);
+                    Renderer renderer = renderers[i];
+                    bool candidate = renderer is SkinnedMeshRenderer && !locked.Contains(renderer);
+                    bool allowed = occluderAllowed(renderer);
+                    Geometry g = Capture(renderer, bounds.center);
+                    if (g == null) continue;
+                    g.candidate = candidate;
+                    // Toggleable renderers stay in the structure only to estimate what they would save.
+                    g.toggleable = !allowed;
+                    geometries.Add(g);
+                }
+                List<Geometry> candidates = geometries.Where(g => g.candidate).ToList();
+                if (candidates.Count == 0 || geometries.Count < 2)
+                {
+                    notes.Add("Скрытые под одеждой треугольники: нечего удалять (нет подходящих мешей тела и одежды).");
+                    return 0;
+                }
+
+                float height = Mathf.Max(bounds.size.y, 0.1f);
+                // Covering clothing is close to the skin: farther hits (another limb, a skirt hem) move with animation.
+                float reach = Mathf.Clamp(height * 0.1f, 0.03f, 0.5f), offset = height * 1e-4f;
+
+                var bvh = new Bvh(geometries);
+                bool[] noCover = bvh.Owners.Select(o => geometries[o].toggleable).ToArray();
+                var tester = new Tester(bvh, reach, offset);
+
+                // Pass 1: only always-visible covers.
+                var hidden = new Dictionary<Geometry, bool[]>();
+                for (int c = 0; c < candidates.Count; c++)
+                    hidden[candidates[c]] = tester.Hidden(candidates[c], geometries.IndexOf(candidates[c]), noCover, null, 0.1f + 0.5f * c / candidates.Count);
+                // Pass 2: a cover may itself be a candidate that loses triangles. Recheck pass-1 results while
+                // ignoring every triangle pass 1 could remove, so each final result relies only on geometry that stays.
+                if (candidates.Count > 1)
+                {
+                    bool[] ignore = (bool[])noCover.Clone();
+                    for (int t = 0; t < ignore.Length; t++)
+                    {
+                        Geometry owner = geometries[bvh.Owners[t]];
+                        if (owner.candidate && hidden[owner][bvh.Local[t]]) ignore[t] = true;
+                    }
+                    for (int c = 0; c < candidates.Count; c++)
+                        hidden[candidates[c]] = tester.Hidden(candidates[c], geometries.IndexOf(candidates[c]), ignore, hidden[candidates[c]], 0.6f + 0.15f * c / candidates.Count);
+                }
+
+                int removed = 0, keptByShapes = 0, potential = 0;
+                var changed = new List<string>();
+                for (int c = 0; c < candidates.Count; c++)
+                {
+                    Geometry g = candidates[c];
+                    bool[] cut = Dilate(g, hidden[g], out int shapes);
+                    keptByShapes += shapes;
+                    // Estimate only: what toggleable clothing hides as well (the full test, without the safety ring).
+                    if (noCover.Any(x => x))
+                    {
+                        bool[] withToggles = tester.Hidden(g, geometries.IndexOf(g), null, null, 0.75f + 0.2f * c / candidates.Count, hidden[g]);
+                        for (int t = 0; t < withToggles.Length; t++)
+                            if (withToggles[t] && !hidden[g][t] && !TouchesMoved(g, t)) potential++;
+                    }
+                    int count = cut.Count(x => x);
+                    if (count == 0) continue;
+                    Apply(g, cut, save);
+                    changed.Add(g.renderer.name + " " + g.TriangleCount + " → " + (g.TriangleCount - count));
+                    removed += count;
+                }
+                notes.Add("Удалено треугольников тела, полностью закрытых одеждой: " + removed +
+                    (changed.Count > 0 ? " (" + string.Join(", ", changed) + ")" : "") +
+                    ". Оставлены треугольники с шейпкеями: " + keptByShapes +
+                    "; под переключаемой одеждой можно было бы убрать ещё " + potential +
+                    ", но они оставлены, чтобы при её выключении не было дыр.");
+                return removed;
+            }
+            finally
+            {
+                foreach (Geometry g in geometries)
+                    if (g.ownsReadable && g.readable != null) Object.DestroyImmediate(g.readable);
+            }
+        }
+
+        // Positions are kept relative to the avatar centre: an avatar placed far from the origin
+        // must not lose float precision in ray tests.
+        private static Geometry Capture(Renderer renderer, Vector3 centre)
+        {
+            Mesh mesh = BSLKClubGeometry.MeshOf(renderer);
+            if (mesh == null) return null;
+            for (int s = 0; s < mesh.subMeshCount; s++)
+                if (mesh.GetTopology(s) != MeshTopology.Triangles) return null;
+            var g = new Geometry { renderer = renderer, readable = mesh };
+            if (!mesh.isReadable) { g.readable = BSLKClubGeometry.ReadableCopy(mesh); g.ownsReadable = true; }
+            g.positions = WorldVertices(renderer, g.readable);
+            if (g.positions == null) return null;
+            for (int v = 0; v < g.positions.Length; v++) g.positions[v] -= centre;
+
+            var triangles = new List<int>();
+            var submeshOf = new List<int>();
+            for (int s = 0; s < g.readable.subMeshCount; s++)
+            {
+                int[] indices = g.readable.GetIndices(s);
+                triangles.AddRange(indices);
+                for (int t = 0; t < indices.Length / 3; t++) submeshOf.Add(s);
+            }
+            g.triangles = triangles.ToArray();
+            g.triangleSubmesh = submeshOf.ToArray();
+
+            Vector3[] local = g.readable.vertices;
+            var ids = new Dictionary<Vector3, int>();
+            g.welded = new int[local.Length];
+            for (int v = 0; v < local.Length; v++)
+            {
+                if (!ids.TryGetValue(local[v], out int id)) ids[local[v]] = id = ids.Count;
+                g.welded[v] = id;
+            }
+            g.moved = new bool[ids.Count];
+            if (g.readable.blendShapeCount > 0)
+            {
+                var delta = new Vector3[local.Length];
+                var normals = new Vector3[local.Length];
+                var tangents = new Vector3[local.Length];
+                for (int s = 0; s < g.readable.blendShapeCount; s++)
+                    for (int f = 0; f < g.readable.GetBlendShapeFrameCount(s); f++)
+                    {
+                        g.readable.GetBlendShapeFrameVertices(s, f, delta, normals, tangents);
+                        // Shrink keys and expressions move vertices out from under the clothing: never cut them.
+                        for (int v = 0; v < delta.Length; v++)
+                            if (delta[v].sqrMagnitude > 1e-12f) g.moved[g.welded[v]] = true;
+                    }
+            }
+            return g;
+        }
+
+        // Current pose in world space. BakeMesh(useScale: true) returns the posed mesh in the renderer's local
+        // space (verified against manual skinning), so the full localToWorldMatrix applies, including scale.
+        internal static Vector3[] WorldVertices(Renderer renderer, Mesh readable)
+        {
+            Transform t = renderer.transform;
+            if (renderer is SkinnedMeshRenderer skinned)
+            {
+                Mesh original = skinned.sharedMesh;
+                var weights = new float[original.blendShapeCount];
+                for (int s = 0; s < weights.Length; s++) weights[s] = skinned.GetBlendShapeWeight(s);
+                var baked = new Mesh();
+                try
+                {
+                    if (original != readable) skinned.sharedMesh = readable;
+                    skinned.BakeMesh(baked, true);
+                }
+                finally
+                {
+                    if (skinned.sharedMesh != original) skinned.sharedMesh = original;
+                    for (int s = 0; s < weights.Length; s++) skinned.SetBlendShapeWeight(s, weights[s]);
+                }
+                Vector3[] vertices = baked.vertices;
+                Object.DestroyImmediate(baked);
+                if (vertices.Length != readable.vertexCount) return null;
+                Matrix4x4 m = t.localToWorldMatrix;
+                for (int v = 0; v < vertices.Length; v++) vertices[v] = m.MultiplyPoint3x4(vertices[v]);
+                return vertices;
+            }
+            Vector3[] result = readable.vertices;
+            Matrix4x4 world = t.localToWorldMatrix;
+            for (int v = 0; v < result.Length; v++) result[v] = world.MultiplyPoint3x4(result[v]);
+            return result;
+        }
+
+        // Vector3.normalized returns zero below 1e-5: cross products of millimetre-sized triangles are smaller.
+        private static Vector3 Unit(Vector3 v)
+        {
+            float length = v.magnitude;
+            return length > 0f ? v / length : Vector3.zero;
+        }
+
+        private static bool TouchesMoved(Geometry g, int triangle)
+        {
+            return g.moved[g.welded[g.triangles[triangle * 3]]] || g.moved[g.welded[g.triangles[triangle * 3 + 1]]] || g.moved[g.welded[g.triangles[triangle * 3 + 2]]];
+        }
+
+        // Safety ring: a hidden triangle sharing a position with any kept triangle stays, so sampling misses
+        // and small pose changes at clothing edges do not open cracks.
+        private static bool[] Dilate(Geometry g, bool[] hidden, out int keptByShapes)
+        {
+            keptByShapes = 0;
+            int count = g.TriangleCount;
+            var keep = new bool[count];
+            var nearKept = new bool[g.moved.Length];
+            for (int t = 0; t < count; t++)
+            {
+                keep[t] = !hidden[t] || TouchesMoved(g, t);
+                if (hidden[t] && keep[t]) keptByShapes++;
+                if (keep[t])
+                    for (int k = 0; k < 3; k++) nearKept[g.welded[g.triangles[t * 3 + k]]] = true;
+            }
+            var cut = new bool[count];
+            for (int t = 0; t < count; t++)
+                cut[t] = !keep[t] && !nearKept[g.welded[g.triangles[t * 3]]] && !nearKept[g.welded[g.triangles[t * 3 + 1]]] && !nearKept[g.welded[g.triangles[t * 3 + 2]]];
+            return cut;
+        }
+
+        // Only index buffers change: vertices, weights, bind poses, blend shapes and slots stay as they are.
+        private static void Apply(Geometry g, bool[] cut, Func<Mesh, Mesh> save)
+        {
+            var skinned = (SkinnedMeshRenderer)g.renderer;
+            Mesh original = skinned.sharedMesh;
+            Mesh result = g.ownsReadable ? g.readable : BSLKClubGeometry.ReadableCopy(original);
+            if (g.ownsReadable) g.readable = null;
+            result.name = original.name;
+            var submeshes = Enumerable.Range(0, result.subMeshCount).Select(_ => new List<int>()).ToList();
+            for (int t = 0; t < cut.Length; t++)
+                if (!cut[t])
+                    for (int k = 0; k < 3; k++) submeshes[g.triangleSubmesh[t]].Add(g.triangles[t * 3 + k]);
+            Bounds bounds = result.bounds;
+            for (int s = 0; s < submeshes.Count; s++) result.SetIndices(submeshes[s], MeshTopology.Triangles, s, false);
+            result.bounds = bounds;
+            var weights = new float[original.blendShapeCount];
+            for (int s = 0; s < weights.Length; s++) weights[s] = skinned.GetBlendShapeWeight(s);
+            skinned.sharedMesh = save(result);
+            for (int s = 0; s < weights.Length && s < result.blendShapeCount; s++) skinned.SetBlendShapeWeight(s, weights[s]);
+        }
+
+        // Visibility sampling for one candidate renderer.
+        private sealed class Tester
+        {
+            private readonly Bvh bvh;
+            private readonly float reach, offset;
+
+            public Tester(Bvh bvh, float reach, float offset)
+            {
+                this.bvh = bvh;
+                this.reach = reach;
+                this.offset = offset;
+            }
+
+            // only == null: test every triangle; otherwise only triangles marked there. skip: triangles already known hidden.
+            public bool[] Hidden(Geometry g, int owner, bool[] ignore, bool[] only, float progress, bool[] skip = null)
+            {
+                int count = g.TriangleCount;
+                Vector3[] p = g.positions;
+                int[] tri = g.triangles;
+                // Smooth per-position normals so every copy of a seam vertex is sampled the same way.
+                var normals = new Vector3[g.moved.Length];
+                var faces = new Vector3[count];
+                for (int t = 0; t < count; t++)
+                {
+                    Vector3 a = p[tri[t * 3]], b = p[tri[t * 3 + 1]], c = p[tri[t * 3 + 2]];
+                    Vector3 n = Vector3.Cross(b - a, c - a);
+                    faces[t] = n;
+                    for (int k = 0; k < 3; k++) normals[g.welded[tri[t * 3 + k]]] += n;
+                }
+                var state = new sbyte[g.moved.Length]; // 0 unknown, 1 hidden, -1 visible
+                var result = new bool[count];
+                for (int t = 0; t < count; t++)
+                {
+                    if ((t & 2047) == 0) BSLKClubOptimizer.Progress("Скрытые треугольники: " + g.renderer.name, progress);
+                    if (skip != null && skip[t]) { result[t] = true; continue; }
+                    if (only != null && !only[t]) continue;
+                    Vector3 face = faces[t];
+                    float area = face.magnitude;
+                    if (area < 1e-12f) continue;
+                    face /= area;
+                    bool hiddenAll = true;
+                    for (int k = 0; k < 3 && hiddenAll; k++)
+                    {
+                        int v = tri[t * 3 + k], id = g.welded[v];
+                        if (state[id] == 0) state[id] = (sbyte)(PointHidden(p[v], Unit(normals[id]), owner, ignore) ? 1 : -1);
+                        hiddenAll = state[id] > 0;
+                    }
+                    if (!hiddenAll) continue;
+                    Vector3 v0 = p[tri[t * 3]], v1 = p[tri[t * 3 + 1]], v2 = p[tri[t * 3 + 2]], centre = (v0 + v1 + v2) / 3f;
+                    hiddenAll = PointHidden(centre, face, owner, ignore) && PointHidden((v0 + centre) * 0.5f, face, owner, ignore) &&
+                        PointHidden((v1 + centre) * 0.5f, face, owner, ignore) && PointHidden((v2 + centre) * 0.5f, face, owner, ignore);
+                    result[t] = hiddenAll;
+                }
+                return result;
+            }
+
+            private bool PointHidden(Vector3 point, Vector3 normal, int owner, bool[] ignore)
+            {
+                if (normal.sqrMagnitude < 0.5f) return false;
+                Vector3 tangent = Vector3.Cross(normal, Mathf.Abs(normal.y) < 0.9f ? Vector3.up : Vector3.right).normalized;
+                Vector3 bitangent = Vector3.Cross(normal, tangent);
+                Vector3 origin = point + normal * offset;
+                foreach (Vector3 d in Directions)
+                {
+                    Vector3 direction = tangent * d.x + bitangent * d.y + normal * d.z;
+                    if (!bvh.AnyHit(origin, direction, reach, owner, ignore)) return false;
+                }
+                return true;
+            }
+        }
+
+        // Bounding volume hierarchy over all cover triangles with a filtered any-hit query.
+        private sealed class Bvh
+        {
+            private const int LeafSize = 4;
+            private readonly float[] tri;      // v0, edge1, edge2, normal: 12 floats per triangle
+            private readonly bool[] twoSided;
+            public readonly int[] Owners, Local;
+            private readonly int[] order;
+            private readonly float[] boxes;  // min xyz, max xyz per node
+            private readonly int[] first, count, left, right;
+            private readonly int[] stack = new int[256];
+
+            public Bvh(List<Geometry> geometries)
+            {
+                var data = new List<float>();
+                var sided = new List<bool>();
+                var owners = new List<int>();
+                var local = new List<int>();
+                for (int o = 0; o < geometries.Count; o++)
+                {
+                    Geometry g = geometries[o];
+                    Material[] materials = g.renderer.sharedMaterials;
+                    for (int t = 0; t < g.TriangleCount; t++)
+                    {
+                        int s = g.triangleSubmesh[t];
+                        // Missing slots do not draw; see-through materials do not hide what is behind them.
+                        Material material = s < materials.Length ? materials[s] : null;
+                        if (material == null || SeeThrough(material) || TouchesMoved(g, t)) continue;
+                        Vector3 a = g.positions[g.triangles[t * 3]], b = g.positions[g.triangles[t * 3 + 1]], c = g.positions[g.triangles[t * 3 + 2]];
+                        Vector3 e1 = b - a, e2 = c - a, n = Vector3.Cross(e1, e2);
+                        if (n.sqrMagnitude < 1e-20f) continue;
+                        n = Unit(n);
+                        data.Add(a.x); data.Add(a.y); data.Add(a.z);
+                        data.Add(e1.x); data.Add(e1.y); data.Add(e1.z);
+                        data.Add(e2.x); data.Add(e2.y); data.Add(e2.z);
+                        data.Add(n.x); data.Add(n.y); data.Add(n.z);
+                        sided.Add(material.HasProperty("_Cull") && material.GetFloat("_Cull") == 0f);
+                        owners.Add(o);
+                        local.Add(t);
+                    }
+                }
+                tri = data.ToArray();
+                twoSided = sided.ToArray();
+                Owners = owners.ToArray();
+                Local = local.ToArray();
+                order = Enumerable.Range(0, Owners.Length).ToArray();
+                var centres = new float[Owners.Length * 3];
+                for (int t = 0; t < Owners.Length; t++)
+                    for (int k = 0; k < 3; k++)
+                        centres[t * 3 + k] = tri[t * 12 + k] + (tri[t * 12 + 3 + k] + tri[t * 12 + 6 + k]) / 3f;
+                var nodes = new Nodes();
+                if (Owners.Length > 0) Build(0, Owners.Length, centres, nodes);
+                boxes = nodes.boxes.ToArray();
+                first = nodes.first.ToArray();
+                count = nodes.count.ToArray();
+                left = nodes.left.ToArray();
+                right = nodes.right.ToArray();
+            }
+
+            private sealed class Nodes
+            {
+                public readonly List<float> boxes = new List<float>();
+                public readonly List<int> first = new List<int>(), count = new List<int>(), left = new List<int>(), right = new List<int>();
+            }
+
+            private static bool SeeThrough(Material material)
+            {
+                return material.renderQueue >= (int)RenderQueue.AlphaTest || material.IsKeywordEnabled("_ALPHATEST_ON") ||
+                    material.IsKeywordEnabled("_ALPHABLEND_ON") || material.IsKeywordEnabled("_ALPHAPREMULTIPLY_ON");
+            }
+
+            private int Build(int start, int length, float[] centres, Nodes nodes)
+            {
+                int node = nodes.count.Count;
+                nodes.first.Add(start); nodes.count.Add(length); nodes.left.Add(-1); nodes.right.Add(-1);
+                float[] min = { float.MaxValue, float.MaxValue, float.MaxValue }, max = { float.MinValue, float.MinValue, float.MinValue };
+                float[] cmin = { float.MaxValue, float.MaxValue, float.MaxValue }, cmax = { float.MinValue, float.MinValue, float.MinValue };
+                for (int i = start; i < start + length; i++)
+                {
+                    int t = order[i] * 12;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        float a = tri[t + k], b = a + tri[t + 3 + k], c = a + tri[t + 6 + k], centre = centres[order[i] * 3 + k];
+                        min[k] = Math.Min(min[k], Math.Min(a, Math.Min(b, c)));
+                        max[k] = Math.Max(max[k], Math.Max(a, Math.Max(b, c)));
+                        cmin[k] = Math.Min(cmin[k], centre);
+                        cmax[k] = Math.Max(cmax[k], centre);
+                    }
+                }
+                nodes.boxes.AddRange(min);
+                nodes.boxes.AddRange(max);
+                if (length <= LeafSize) return node;
+                int axis = 0;
+                for (int k = 1; k < 3; k++) if (cmax[k] - cmin[k] > cmax[axis] - cmin[axis]) axis = k;
+                float split = (cmin[axis] + cmax[axis]) * 0.5f;
+                int lo = start, hi = start + length - 1;
+                while (lo <= hi)
+                {
+                    if (centres[order[lo] * 3 + axis] < split) lo++;
+                    else { int swap = order[lo]; order[lo] = order[hi]; order[hi] = swap; hi--; }
+                }
+                int half = lo - start;
+                if (half == 0 || half == length) half = length / 2; // identical centres
+                nodes.count[node] = 0;
+                int l = Build(start, half, centres, nodes), r = Build(start + half, length - half, centres, nodes);
+                nodes.left[node] = l;
+                nodes.right[node] = r;
+                return node;
+            }
+
+            public bool AnyHit(Vector3 origin, Vector3 direction, float reach, int skipOwner, bool[] ignore)
+            {
+                if (Owners.Length == 0) return false;
+                float ox = origin.x, oy = origin.y, oz = origin.z, dx = direction.x, dy = direction.y, dz = direction.z;
+                float ix = 1f / (Math.Abs(dx) > 1e-12f ? dx : 1e-12f), iy = 1f / (Math.Abs(dy) > 1e-12f ? dy : 1e-12f), iz = 1f / (Math.Abs(dz) > 1e-12f ? dz : 1e-12f);
+                int sp = 0;
+                stack[sp++] = 0;
+                while (sp > 0)
+                {
+                    int node = stack[--sp], b = node * 6;
+                    float t1 = (boxes[b] - ox) * ix, t2 = (boxes[b + 3] - ox) * ix;
+                    float near = Math.Min(t1, t2), far = Math.Max(t1, t2);
+                    t1 = (boxes[b + 1] - oy) * iy; t2 = (boxes[b + 4] - oy) * iy;
+                    near = Math.Max(near, Math.Min(t1, t2)); far = Math.Min(far, Math.Max(t1, t2));
+                    t1 = (boxes[b + 2] - oz) * iz; t2 = (boxes[b + 5] - oz) * iz;
+                    near = Math.Max(near, Math.Min(t1, t2)); far = Math.Min(far, Math.Max(t1, t2));
+                    if (far < Math.Max(near, 0f) || near > reach) continue;
+                    if (left[node] >= 0)
+                    {
+                        if (sp + 2 > stack.Length) return false; // pathological depth: treat as visible
+                        stack[sp++] = left[node];
+                        stack[sp++] = right[node];
+                        continue;
+                    }
+                    for (int i = first[node], end = first[node] + count[node]; i < end; i++)
+                    {
+                        int id = order[i];
+                        if (Owners[id] == skipOwner || ignore != null && ignore[id]) continue;
+                        int t = id * 12;
+                        // A single-sided face is drawn only toward its normal; the viewer looks back along the ray.
+                        if (!twoSided[id] && tri[t + 9] * dx + tri[t + 10] * dy + tri[t + 11] * dz <= 0f) continue;
+                        float e1x = tri[t + 3], e1y = tri[t + 4], e1z = tri[t + 5], e2x = tri[t + 6], e2y = tri[t + 7], e2z = tri[t + 8];
+                        float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+                        float det = e1x * px + e1y * py + e1z * pz;
+                        if (Math.Abs(det) < 1e-14f) continue;
+                        float inv = 1f / det;
+                        float sx = ox - tri[t], sy = oy - tri[t + 1], sz = oz - tri[t + 2];
+                        float u = (sx * px + sy * py + sz * pz) * inv;
+                        // A small overlap keeps rays through shared edges and vertices from slipping between
+                        // neighbouring triangles because of rounding; 0.1% of a triangle cannot hide a real gap.
+                        if (u < -1e-3f || u > 1.001f) continue;
+                        float qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x;
+                        float v = (dx * qx + dy * qy + dz * qz) * inv;
+                        if (v < -1e-3f || u + v > 1.001f) continue;
+                        float distance = (e2x * qx + e2y * qy + e2z * qz) * inv;
+                        if (distance > 0f && distance <= reach) return true;
+                    }
+                }
+                return false;
             }
         }
     }

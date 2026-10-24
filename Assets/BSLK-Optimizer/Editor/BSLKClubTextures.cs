@@ -61,45 +61,56 @@ namespace BSLK.Optimizer
                     long acceptedBytes = beforeBytes;
                     float lastError = 0;
                     bool anyAccepted = false;
+                    // Retain existing block compression; BC7 only for uncompressed/automatic inputs. A fully
+                    // opaque texture also tries DXT1, half the memory of BC7/DXT5; the error check decides.
+                    TextureImporterFormat baseFormat = IsCompact(texture.format) ? ExistingFormat(texture.format) : TextureImporterFormat.BC7;
+                    var formats = new List<TextureImporterFormat>();
+                    if (baseFormat != TextureImporterFormat.DXT1 && reference.All(p => p.a == 255)) formats.Add(TextureImporterFormat.DXT1);
+                    formats.Add(baseFormat);
+                    TextureImporterFormat acceptedFormat = baseFormat;
                     // First try PC compression at current resolution; then halve until error budget is exhausted.
                     int candidateSize = Mathf.NextPowerOfTwo(acceptedMax);
                     while (candidateSize >= options.minimumTextureSize)
                     {
-                        BSLKClubOptimizer.Progress("Проверка " + texture.name + " → " + candidateSize, (float)i / Math.Max(1, textures.Length));
-                        TextureImporterPlatformSettings settings = importer.GetPlatformTextureSettings("Standalone");
-                        settings.name = "Standalone";
-                        settings.overridden = true;
-                        settings.maxTextureSize = candidateSize;
-                        // Retain existing block compression. BC7 is used only for uncompressed/automatic inputs.
-                        settings.format = IsCompact(texture.format) ? ExistingFormat(texture.format) : TextureImporterFormat.BC7;
-                        settings.crunchedCompression = false;
-                        settings.compressionQuality = 100;
-                        importer.SetPlatformTextureSettings(settings);
-                        importer.SaveAndReimport();
-                        texture = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
-                        long candidateBytes = Bytes(texture);
-                        Color32[] candidate = Readback(texture, width, height);
-                        float error = Error(reference, candidate, out float damagedFraction);
-                        if (error > options.textureError || damagedFraction > 0.005f)
+                        bool passed = false, applied = false;
+                        foreach (TextureImporterFormat format in formats)
                         {
-                            importer.SetPlatformTextureSettings(acceptedSettings);
+                            BSLKClubOptimizer.Progress("Проверка " + texture.name + " → " + candidateSize + " " + format, (float)i / Math.Max(1, textures.Length));
+                            TextureImporterPlatformSettings settings = importer.GetPlatformTextureSettings("Standalone");
+                            settings.name = "Standalone";
+                            settings.overridden = true;
+                            settings.maxTextureSize = candidateSize;
+                            settings.format = format;
+                            settings.crunchedCompression = false;
+                            settings.compressionQuality = 100;
+                            importer.SetPlatformTextureSettings(settings);
                             importer.SaveAndReimport();
-                            break;
+                            texture = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                            long candidateBytes = Bytes(texture);
+                            Color32[] candidate = Readback(texture, width, height);
+                            float error = Error(reference, candidate, out float damagedFraction);
+                            if (error > options.textureError || damagedFraction > 0.005f) continue;
+                            passed = true;
+                            if (candidateBytes < acceptedBytes)
+                            {
+                                acceptedSettings = importer.GetPlatformTextureSettings("Standalone");
+                                acceptedBytes = candidateBytes;
+                                acceptedMax = Math.Max(texture.width, texture.height);
+                                acceptedFormat = format;
+                                lastError = error;
+                                anyAccepted = true;
+                                applied = true;
+                                break;
+                            }
                         }
-                        if (candidateBytes < acceptedBytes)
-                        {
-                            acceptedSettings = importer.GetPlatformTextureSettings("Standalone");
-                            acceptedBytes = candidateBytes;
-                            acceptedMax = Math.Max(texture.width, texture.height);
-                            lastError = error;
-                            anyAccepted = true;
-                        }
-                        else
+                        // Leave the importer in the last accepted state before stopping or halving again.
+                        if (!applied)
                         {
                             importer.SetPlatformTextureSettings(acceptedSettings);
                             importer.SaveAndReimport();
                             texture = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
                         }
+                        if (!passed) break;
                         candidateSize /= 2;
                     }
                     if (anyAccepted)
@@ -107,7 +118,7 @@ namespace BSLK.Optimizer
                         changed++;
                         context.notes.Add("Текстура " + texture.name + ": " + width + "×" + height + " → max " + acceptedMax +
                             ", " + (beforeBytes / 1048576.0).ToString("F2") + " → " + (acceptedBytes / 1048576.0).ToString("F2") +
-                            " MiB, ошибка " + lastError.ToString("F4") + ".");
+                            " MiB, " + acceptedFormat + ", ошибка " + lastError.ToString("F4") + ".");
                     }
                     // Read/Write affects CPU memory, not the GPU budget; do not advertise it as VRAM savings.
                     if (importer.isReadable) { importer.isReadable = false; importer.SaveAndReimport(); }
