@@ -42,6 +42,7 @@ namespace BSLK.Optimizer
         private List<Renderer> simplified;
         private List<PlanEntry> autoPlan;
         private string autoPlanNote = "";
+        private string hiddenNote = "";
         [SerializeField] private int autoBudget = (int)BSLKClubOptimizer.TriangleLimit;
         [SerializeField] private bool autoProtectFaceHands = true;
         private bool updating;
@@ -279,6 +280,7 @@ namespace BSLK.Optimizer
                     EditorUtility.DisplayDialog("BSLK Optimizer", "Build-плагины будут запущены на временной копии, как при загрузке. VRCFury при этом сохраняет все несохранённые изменения ассетов проекта. Продолжить?", "Проверить", "Отмена"))
                     EditorApplication.delayCall += BuildCheck;
             EndCard();
+            HiddenBodyTool();
             AutoSimplifyTool();
             SimplifyTool();
         }
@@ -352,7 +354,7 @@ namespace BSLK.Optimizer
             if (simplifyTarget != null && !InResult(simplifyTarget))
                 GUILayout.Label("Объект в сцене получит новый упрощённый меш; файл исходного меша не меняется. Все упрощённые объекты перечислены ниже, их можно вернуть по одному или все сразу.", small);
             simplifyRatio = EditorGUILayout.Slider("Оставить треугольников, %", simplifyRatio * 100, 10, 95) / 100;
-            simplifyLockShapes = EditorGUILayout.ToggleLeft("Не трогать вершины blend shapes (лицо, мимика, shrink)", simplifyLockShapes);
+            simplifyLockShapes = EditorGUILayout.ToggleLeft("Сохранять форму blend shapes (лицо, мимика, shrink)", simplifyLockShapes);
             Mesh current = simplifyTarget != null ? BSLKClubGeometry.MeshOf(simplifyTarget) : null;
             if (current != null)
             {
@@ -374,7 +376,7 @@ namespace BSLK.Optimizer
             if (simplified == null) simplified = FindSimplified();
             GUILayout.Space(6);
             EditorGUILayout.BeginHorizontal();
-            GUILayout.Label("Упрощённые меши в сцене: " + simplified.Count, EditorStyles.boldLabel);
+            GUILayout.Label("Изменённые меши в сцене (упрощение, вырезание): " + simplified.Count, EditorStyles.boldLabel);
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("Обновить", GUILayout.Width(80))) simplified = FindSimplified();
             EditorGUILayout.EndHorizontal();
@@ -467,6 +469,68 @@ namespace BSLK.Optimizer
             return saved;
         }
 
+        // ---- Body under clothing, on demand
+
+        private void HiddenBodyTool()
+        {
+            BeginCard("Вырезать тело под одеждой", Orange);
+            GameObject target = AutoTarget;
+            if (target == null)
+            {
+                GUILayout.Label("Выберите аватар на вкладке «Создание».", small);
+                EndCard();
+                return;
+            }
+            GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: в сцене получит новые меши, файлы моделей не меняются)") +
+                ". Убираются треугольники тела, полностью закрытые одеждой в текущей позе. Одежда, которую можно снять тогглом или анимацией, и прозрачная одежда укрытием не считаются, чтобы не появлялись дыры. Вернуть можно в списке изменённых мешей ниже.", small);
+            if (ColoredButton("Вырезать скрытое тело", Orange)) EditorApplication.delayCall += CutHiddenBody;
+            if (!string.IsNullOrEmpty(hiddenNote)) GUILayout.Label(hiddenNote, wrap);
+            EndCard();
+        }
+
+        private void CutHiddenBody()
+        {
+            GameObject target = AutoTarget;
+            if (target == null) return;
+            List<AnimationClip> clips = BSLKClubOptimizer.AvatarClips(target).ToList();
+            HashSet<Renderer> locked = BSLKClubOptimizer.RuntimeRenderers(target, clips, out HashSet<Renderer> toggleable);
+            SkinnedMeshRenderer[] renderers = target.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            var before = renderers.ToDictionary(r => r, r => r.sharedMesh);
+            long trianglesBefore = BSLKClubOptimizer.TriangleTotal(target);
+            var notes = new List<string>();
+            Undo.SetCurrentGroupName("Вырезать тело под одеждой");
+            int group = Undo.GetCurrentGroup();
+            Undo.RecordObjects(renderers, "Вырезать тело под одеждой");
+            try
+            {
+                string folder = target == lastResult ? ResultFolder() : SimplifiedFolder();
+                BSLKClubOcclusion.RemoveHiddenTriangles(target, locked, renderer => !toggleable.Contains(renderer), mesh =>
+                {
+                    AssetDatabase.CreateAsset(mesh, AssetDatabase.GenerateUniqueAssetPath(folder + "/" + mesh.name + "_hidden.asset"));
+                    return mesh;
+                }, notes, BSLKClubOptimizer.LiveShapes(target, clips));
+                // Remember each original so the cut can be undone from the list of changed meshes later.
+                foreach (SkinnedMeshRenderer renderer in renderers)
+                {
+                    if (renderer.sharedMesh == before[renderer] || before[renderer] == null) continue;
+                    string path = AssetDatabase.GetAssetPath(renderer.sharedMesh);
+                    AssetImporter importer = AssetImporter.GetAtPath(path);
+                    importer.userData = OriginalMarker + GlobalObjectId.GetGlobalObjectIdSlow(OriginalOf(before[renderer]) ?? before[renderer]);
+                    importer.SaveAndReimport();
+                    renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(path);
+                    if (PrefabUtility.IsPartOfPrefabInstance(renderer)) PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
+                }
+                hiddenNote = string.Join("\n", notes) + "\nТреугольников: " + trianglesBefore + " → " + BSLKClubOptimizer.TriangleTotal(target) + ".";
+            }
+            catch (OperationCanceledException) { hiddenNote = "Отменено."; }
+            catch (Exception exception) { hiddenNote = "Не удалось вырезать: " + exception.Message; Debug.LogException(exception); }
+            finally { EditorUtility.ClearProgressBar(); }
+            Undo.CollapseUndoOperations(group);
+            simplified = null;
+            insights = BSLKClubInsights.Collect(target);
+            Repaint();
+        }
+
         // ---- Automatic simplification toward the triangle limit
 
         internal sealed class PlanEntry
@@ -540,7 +604,7 @@ namespace BSLK.Optimizer
             long after = total - eligibleTotal + plan.Sum(e => (long)e.planned);
             note = "Сейчас " + total + ", цель " + budget + ". Оставить ~" + Mathf.RoundToInt(keep * 100) + "% треугольников у " + plan.Count + " мешей → ~" + after + "." +
                 (after > budget ? " Даже так цель не достигается: остальное — лицо, мелкие меши и защищённые участки." : "") +
-                " Края, швы UV" + (simplifyLockShapes ? ", вершины blend shapes" : "") + (autoProtectFaceHands ? ", лицо и кисти" : "") + " не упрощаются, поэтому итог может быть выше плана.";
+                " Края, швы UV" + (simplifyLockShapes ? ", участки, которые blend shapes двигают по-разному" : "") + (autoProtectFaceHands ? ", лицо и кисти" : "") + " не упрощаются, поэтому итог может быть выше плана.";
             return plan;
         }
 

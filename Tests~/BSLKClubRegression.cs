@@ -318,7 +318,13 @@ public static class BSLKClubRegression
         Check(!imported.isReadable && BSLKClubGeometry.TriangleCount(importedSimple) <= importedBefore * 0.5f && BSLKClubGeometry.TriangleCount(imported) == importedBefore,
             "Model without Read/Write simplified into a new mesh, source untouched");
         Mesh lockedShapes = BSLKClubGeometry.Simplify(mesh, 0.3f, true);
-        Check(BSLKClubGeometry.TriangleCount(lockedShapes) == before, "Vertices moved by blend shapes are not simplified when protected");
+        // Shape keys on every vertex (typical body) must not freeze the mesh; shapes that move
+        // neighbours differently must still limit it.
+        Check(BSLKClubGeometry.TriangleCount(lockedShapes) < before * 0.5f, "Uniform shape keys on all vertices do not block simplification");
+        Mesh uneven = Object.Instantiate(mesh);
+        uneven.ClearBlendShapes();
+        uneven.AddBlendShapeFrame("Ripple", 100, vertices.Select((v, i) => Vector3.up * (((int)v.x % 2) * 2 + (int)v.z % 2)).ToArray(), null, null);
+        Check(BSLKClubGeometry.TriangleCount(BSLKClubGeometry.Simplify(uneven, 0.3f, true)) > after, "Shapes that move neighbours differently keep that geometry");
     }
 
     // Source models usually have Read/Write off: club operations must still work on the copy,

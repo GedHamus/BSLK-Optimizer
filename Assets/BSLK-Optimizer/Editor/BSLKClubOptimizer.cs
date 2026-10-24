@@ -114,7 +114,8 @@ namespace BSLK.Optimizer
                 HashSet<Renderer> locked = LockedRenderers(context, out HashSet<Renderer> toggleable);
                 // Body under worn clothing is cut only when deleting disabled items was not enough.
                 if (options.removeHiddenBody && TriangleTotal(context.avatar) > TriangleLimit)
-                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => !toggleable.Contains(renderer), mesh => SaveMesh(context, mesh), context.notes);
+                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => !toggleable.Contains(renderer), mesh => SaveMesh(context, mesh), context.notes,
+                        LiveShapes(context.avatar, context.copies.Values.OfType<AnimationClip>().Distinct()));
                 if (options.mergeMeshes) BSLKClubGeometry.MergeClothing(context.avatar, locked, ClubClips(context), mesh => SaveMesh(context, mesh), context.notes);
                 if (options.mergeMaterials)
                     context.notes.Add("Объединено слотов с одинаковым материалом: " + BSLKClubGeometry.MergeDuplicateSlots(context.avatar, locked, mesh => SaveMesh(context, mesh)) + ".");
@@ -394,12 +395,24 @@ namespace BSLK.Optimizer
         // switched, or the renderer itself is animated); they must not count as a permanent cover.
         private static HashSet<Renderer> LockedRenderers(Context c, out HashSet<Renderer> toggleable)
         {
+            return RuntimeRenderers(c.avatar, c.copies.Values.OfType<AnimationClip>().Distinct(), out toggleable);
+        }
+
+        // Clips the avatar can play: its controllers (descriptor layers, Animators) and build components.
+        internal static IEnumerable<AnimationClip> AvatarClips(GameObject avatar)
+        {
+            return EditorUtility.CollectDependencies(new Object[] { avatar }).OfType<AnimationClip>().Distinct();
+        }
+
+        internal static HashSet<Renderer> RuntimeRenderers(GameObject avatar, IEnumerable<AnimationClip> clips, out HashSet<Renderer> toggleable)
+        {
             var locked = new HashSet<Renderer>();
             toggleable = new HashSet<Renderer>();
-            Transform root = c.avatar.transform;
+            Transform root = avatar.transform;
+            Func<Transform, string> relative = t => AnimationUtility.CalculateTransformPath(t, root);
             var animated = new HashSet<string>();
             var toggled = new HashSet<string>();
-            foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
+            foreach (Component component in avatar.GetComponentsInChildren<Component>(true))
             {
                 if (component == null || component is Transform || component is Renderer || component is MeshFilter) continue;
                 foreach (Object reference in References(component))
@@ -407,10 +420,10 @@ namespace BSLK.Optimizer
                     if (reference is Renderer renderer) locked.Add(renderer);
                     // Objects switched by build-time toggles (VRCFury etc.) count as animated visibility.
                     else if (reference is GameObject target && target != component.gameObject && target.transform.IsChildOf(root) && target.transform != root)
-                        toggled.Add(Relative(target.transform, c));
+                        toggled.Add(relative(target.transform));
                 }
             }
-            foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
+            foreach (AnimationClip clip in clips)
             {
                 foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
                 {
@@ -420,15 +433,15 @@ namespace BSLK.Optimizer
                 foreach (EditorCurveBinding binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
                     if (typeof(Renderer).IsAssignableFrom(binding.type)) animated.Add(binding.path);
             }
-            foreach (Renderer renderer in c.avatar.GetComponentsInChildren<Renderer>(true))
+            foreach (Renderer renderer in avatar.GetComponentsInChildren<Renderer>(true))
             {
-                if (animated.Contains(Relative(renderer.transform, c))) { locked.Add(renderer); toggleable.Add(renderer); continue; }
+                if (animated.Contains(relative(renderer.transform))) { locked.Add(renderer); toggleable.Add(renderer); continue; }
                 for (Transform t = renderer.transform; t != null && t != root; t = t.parent)
-                    if (toggled.Contains(Relative(t, c))) { toggleable.Add(renderer); break; }
+                    if (toggled.Contains(relative(t))) { toggleable.Add(renderer); break; }
                 for (Transform t = renderer.transform; t != null && t != root; t = t.parent)
                 {
                     bool topLevel = t.parent == root;
-                    if ((!topLevel && toggled.Contains(Relative(t, c))) || (t != renderer.transform && t.GetComponent<Animator>() != null)) { locked.Add(renderer); break; }
+                    if ((!topLevel && toggled.Contains(relative(t))) || (t != renderer.transform && t.GetComponent<Animator>() != null)) { locked.Add(renderer); break; }
                 }
             }
             return locked;
@@ -443,22 +456,30 @@ namespace BSLK.Optimizer
 
         // Keep every shape that is animated, named by any component (visemes, VRCFury, gestures),
         // used for eyelids, or a standard MMD morph; drop the rest from the copy.
-        private static void RemoveUnusedShapesAndBones(Context c, Options options)
+        // Shape names that can change at runtime: animated by clips or named by components
+        // (visemes, VRCFury toggles and gestures). Non-zero weights are checked by the callers.
+        internal static HashSet<string> LiveShapes(GameObject avatar, IEnumerable<AnimationClip> clips)
         {
-            var keep = new HashSet<string>();
-            foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
+            var live = new HashSet<string>();
+            foreach (AnimationClip clip in clips)
                 foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
-                    if (binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal)) keep.Add(binding.propertyName.Substring("blendShape.".Length));
-            foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
+                    if (binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal)) live.Add(binding.propertyName.Substring("blendShape.".Length));
+            foreach (Component component in avatar.GetComponentsInChildren<Component>(true))
             {
                 if (component == null || component is Transform || component is Renderer) continue;
                 using (var serialized = new SerializedObject(component))
                 {
                     SerializedProperty property = serialized.GetIterator();
                     while (property.Next(true))
-                        if (property.propertyType == SerializedPropertyType.String && !string.IsNullOrEmpty(property.stringValue)) keep.Add(property.stringValue);
+                        if (property.propertyType == SerializedPropertyType.String && !string.IsNullOrEmpty(property.stringValue)) live.Add(property.stringValue);
                 }
             }
+            return live;
+        }
+
+        private static void RemoveUnusedShapesAndBones(Context c, Options options)
+        {
+            HashSet<string> keep = LiveShapes(c.avatar, c.copies.Values.OfType<AnimationClip>().Distinct());
             if (options.keepMmdShapes) keep.UnionWith(MmdShapes);
 
             // The descriptor stores eyelid shapes by index: remember names, restore indices afterwards.

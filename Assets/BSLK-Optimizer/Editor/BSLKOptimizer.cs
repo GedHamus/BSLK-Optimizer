@@ -1931,11 +1931,9 @@ namespace BSLK.Optimizer
                         if (parts.weights[k].weight > best) { best = parts.weights[k].weight; dominant = parts.weights[k].boneIndex; }
                     if (protectedBones.Contains(dominant)) locked[v] = true;
                 }
-            if (lockBlendShapes)
-                foreach (var frames in parts.shapes.Values)
-                    foreach (Frame frame in frames)
-                        for (int v = 0; v < vertexCount; v++)
-                            if (frame.vertices[v].sqrMagnitude > 1e-12f) locked[v] = true;
+            // Bodies often have shape keys on every vertex, so locking shaped vertices would freeze the whole
+            // mesh. Instead a collapse is allowed only between vertices that every shape moves alike.
+            Vector3[][] deltas = lockBlendShapes ? parts.shapes.Values.SelectMany(frames => frames).Select(frame => frame.vertices).ToArray() : null;
 
             var quadrics = new double[vertexCount * 10];
             for (int t = 0; t < triangleCount; t++)
@@ -1961,6 +1959,7 @@ namespace BSLK.Optimizer
                 Heap.Entry entry = heap.Pop();
                 int u = entry.u, v = entry.v;
                 if (dead[u] || dead[v] || version[u] != entry.versionU || version[v] != entry.versionV) continue;
+                if (deltas != null && !SameShapes(deltas, parts.positions, u, v)) continue;
                 if (!CanCollapse(u, v, triangles, vertexTriangles, alive, parts.positions)) continue;
                 foreach (int t in vertexTriangles[u])
                 {
@@ -2072,6 +2071,17 @@ namespace BSLK.Optimizer
             return result;
         }
 
+        // Each shape may move the two vertices apart by at most half their distance (0.25 kept only
+        // ~17% on a real 120K body with 181 shape keys; 0.5 gives ~38% while expressions stay intact).
+        private static bool SameShapes(Vector3[][] deltas, List<Vector3> positions, int u, int v)
+        {
+            float tolerance = 0.5f * Vector3.Distance(positions[u], positions[v]) + 1e-5f;
+            tolerance *= tolerance;
+            foreach (Vector3[] delta in deltas)
+                if ((delta[u] - delta[v]).sqrMagnitude > tolerance) return false;
+            return true;
+        }
+
         // Reject collapses that fold a triangle over or pinch the surface into a non-manifold edge.
         private static bool CanCollapse(int u, int v, List<int> triangles, List<int>[] vertexTriangles, bool[] alive, List<Vector3> positions)
         {
@@ -2174,8 +2184,10 @@ namespace BSLK.Optimizer
             return result.ToArray();
         }
 
+        // liveShapes: blend shapes that can change at runtime (animated, named by components, non-zero
+        // weight). Unused shapes cannot uncover anything; null treats every shape as live.
         internal static int RemoveHiddenTriangles(GameObject avatar, HashSet<Renderer> locked, Func<Renderer, bool> occluderAllowed,
-            Func<Mesh, Mesh> save, List<string> notes)
+            Func<Mesh, Mesh> save, List<string> notes, ISet<string> liveShapes = null)
         {
             var geometries = new List<Geometry>();
             try
@@ -2195,7 +2207,7 @@ namespace BSLK.Optimizer
                     Renderer renderer = renderers[i];
                     bool candidate = renderer is SkinnedMeshRenderer && !locked.Contains(renderer);
                     bool allowed = occluderAllowed(renderer);
-                    Geometry g = Capture(renderer, bounds.center);
+                    Geometry g = Capture(renderer, bounds.center, liveShapes);
                     if (g == null) continue;
                     g.candidate = candidate;
                     // Toggleable renderers stay in the structure only to estimate what they would save.
@@ -2271,7 +2283,7 @@ namespace BSLK.Optimizer
 
         // Positions are kept relative to the avatar centre: an avatar placed far from the origin
         // must not lose float precision in ray tests.
-        private static Geometry Capture(Renderer renderer, Vector3 centre)
+        private static Geometry Capture(Renderer renderer, Vector3 centre, ISet<string> liveShapes)
         {
             Mesh mesh = BSLKClubGeometry.MeshOf(renderer);
             if (mesh == null) return null;
@@ -2308,7 +2320,10 @@ namespace BSLK.Optimizer
                 var delta = new Vector3[local.Length];
                 var normals = new Vector3[local.Length];
                 var tangents = new Vector3[local.Length];
+                var skinned = renderer as SkinnedMeshRenderer;
                 for (int s = 0; s < g.readable.blendShapeCount; s++)
+                {
+                    if (liveShapes != null && !liveShapes.Contains(g.readable.GetBlendShapeName(s)) && (skinned == null || skinned.GetBlendShapeWeight(s) == 0)) continue;
                     for (int f = 0; f < g.readable.GetBlendShapeFrameCount(s); f++)
                     {
                         g.readable.GetBlendShapeFrameVertices(s, f, delta, normals, tangents);
@@ -2316,6 +2331,7 @@ namespace BSLK.Optimizer
                         for (int v = 0; v < delta.Length; v++)
                             if (delta[v].sqrMagnitude > 1e-12f) g.moved[g.welded[v]] = true;
                     }
+                }
             }
             return g;
         }
