@@ -1,12 +1,30 @@
 using System;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Networking;
 
 namespace BSLK.Optimizer
 {
+    // Updates install silently: once per editor session in the background, or from the window button.
+    [InitializeOnLoad]
     public static class BSLKUpdater
     {
+        public const string Repo = "GedHamus/BSLK-Optimizer";
+        private const string SessionKey = "BSLK-Optimizer.AutoUpdateChecked";
+
+        static BSLKUpdater()
+        {
+            // Never in batch mode: regression projects and CI must not rewrite their sources.
+            if (Application.isBatchMode || SessionState.GetBool(SessionKey, false)) return;
+            SessionState.SetBool(SessionKey, true);
+            EditorApplication.delayCall += () =>
+            {
+                if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling) return;
+                CheckForUpdates(Repo, status => { });
+            };
+        }
+
         [Serializable]
         private class GitHubRelease
         {
@@ -66,21 +84,8 @@ namespace BSLK.Optimizer
                         return;
                     }
 
-                    if (EditorUtility.DisplayDialog(
-                            "BSLK-Optimizer",
-                            "Доступна новая версия: " + release.tag_name +
-                            "\nТекущая: " + BSLKOptimizer.Version +
-                            "\n\nОбновить сейчас?",
-                            "Обновить",
-                            "Позже"))
-                    {
-                        downloading = true;
-                        DownloadAndUpdate(repo, release.tag_name, onStatus, onComplete);
-                    }
-                    else
-                    {
-                        onStatus("Доступна новая версия: " + release.tag_name);
-                    }
+                    downloading = true;
+                    DownloadAndUpdate(repo, release.tag_name, onStatus, onComplete);
                 }
                 finally
                 {
@@ -98,80 +103,79 @@ namespace BSLK.Optimizer
             string owner = repo.Substring(0, slash);
             string repository = repo.Substring(slash + 1);
 
-            DownloadFiles(owner, repository, tag, 0, new string[UpdateFiles.Length], onStatus, onComplete);
+            // The release's own updater lists its file set, so a release may add editor files.
+            string updater = UpdateFiles[UpdateFiles.Length - 1];
+            Download(owner, repository, tag, updater, text =>
+            {
+                string[] files = UpdateFiles.Union(System.Text.RegularExpressions.Regex.Matches(text, "\"(Assets/BSLK-Optimizer/Editor/[A-Za-z0-9_]+\\.cs)\"")
+                    .Cast<System.Text.RegularExpressions.Match>().Select(m => m.Groups[1].Value)).ToArray();
+                DownloadFiles(owner, repository, tag, files, 0, new string[files.Length], onStatus, onComplete);
+            }, () => { onStatus("Ошибка при скачивании: " + updater); onComplete?.Invoke(); });
         }
 
-        private static void DownloadFiles(string owner, string repository, string tag, int index, string[] contents, Action<string> onStatus, Action onComplete)
+        private static void Download(string owner, string repository, string tag, string relative, Action<string> onText, Action onError)
         {
-            if (index >= UpdateFiles.Length)
-            {
-                try { WriteFiles(contents, tag, onStatus); }
-                catch (Exception e) { onStatus("Обновление не установлено: " + e.Message); }
-                finally { onComplete?.Invoke(); }
-                return;
-            }
-
-            string relative = UpdateFiles[index];
             string url = "https://raw.githubusercontent.com/" + owner + "/" + repository + "/" + tag + "/" + relative;
             UnityWebRequest request = UnityWebRequest.Get(url);
             request.timeout = 20;
             request.SetRequestHeader("User-Agent", "BSLK-Optimizer");
             request.SendWebRequest().completed += operation =>
             {
-                try
-                {
-                    if (request.result != UnityWebRequest.Result.Success || !request.downloadHandler.text.Contains(ContentMarker))
-                    {
-                        onStatus("Ошибка при скачивании: " + relative);
-                        onComplete?.Invoke();
-                        return;
-                    }
-
-                    contents[index] = request.downloadHandler.text;
-                    DownloadFiles(owner, repository, tag, index + 1, contents, onStatus, onComplete);
-                }
-                finally
-                {
-                    request.Dispose();
-                }
+                string text = request.result == UnityWebRequest.Result.Success ? request.downloadHandler.text : null;
+                request.Dispose();
+                if (text == null || !text.Contains(ContentMarker)) onError();
+                else onText(text);
             };
         }
 
-        private static void WriteFiles(string[] contents, string tag, Action<string> onStatus)
+        private static void DownloadFiles(string owner, string repository, string tag, string[] files, int index, string[] contents, Action<string> onStatus, Action onComplete)
+        {
+            if (index >= files.Length)
+            {
+                try { WriteFiles(files, contents, tag, onStatus); }
+                catch (Exception e) { onStatus("Обновление не установлено: " + e.Message); }
+                finally { onComplete?.Invoke(); }
+                return;
+            }
+            Download(owner, repository, tag, files[index], text =>
+            {
+                contents[index] = text;
+                DownloadFiles(owner, repository, tag, files, index + 1, contents, onStatus, onComplete);
+            }, () => { onStatus("Ошибка при скачивании: " + files[index]); onComplete?.Invoke(); });
+        }
+
+        private static void WriteFiles(string[] files, string[] contents, string tag, Action<string> onStatus)
         {
             string version = tag.TrimStart('v', 'V');
 
-            string[] previous = new string[UpdateFiles.Length];
-            for (int i = 0; i < UpdateFiles.Length; i++)
+            string[] previous = new string[files.Length];
+            for (int i = 0; i < files.Length; i++)
             {
                 if (string.IsNullOrEmpty(contents[i]) || !contents[i].Contains(ContentMarker))
                     throw new InvalidOperationException("Неполный комплект файлов обновления.");
-                previous[i] = System.IO.File.Exists(UpdateFiles[i]) ? System.IO.File.ReadAllText(UpdateFiles[i]) : null;
+                previous[i] = System.IO.File.Exists(files[i]) ? System.IO.File.ReadAllText(files[i]) : null;
             }
             AssetDatabase.DisallowAutoRefresh();
             try
             {
-                for (int i = 0; i < UpdateFiles.Length; i++)
+                for (int i = 0; i < files.Length; i++)
                 {
-                    if (previous[i] != null) System.IO.File.WriteAllText(UpdateFiles[i] + ".bak", previous[i]);
-                    System.IO.File.WriteAllText(UpdateFiles[i], PatchVersionInContent(contents[i], version));
+                    if (previous[i] != null) System.IO.File.WriteAllText(files[i] + ".bak", previous[i]);
+                    System.IO.File.WriteAllText(files[i], PatchVersionInContent(contents[i], version));
                 }
             }
             catch
             {
-                for (int i = 0; i < UpdateFiles.Length; i++)
+                for (int i = 0; i < files.Length; i++)
                 {
-                    if (previous[i] != null) System.IO.File.WriteAllText(UpdateFiles[i], previous[i]);
-                    else if (System.IO.File.Exists(UpdateFiles[i])) System.IO.File.Delete(UpdateFiles[i]);
+                    if (previous[i] != null) System.IO.File.WriteAllText(files[i], previous[i]);
+                    else if (System.IO.File.Exists(files[i])) System.IO.File.Delete(files[i]);
                 }
                 throw;
             }
             finally { AssetDatabase.AllowAutoRefresh(); }
 
-            EditorUtility.DisplayDialog(
-                "BSLK-Optimizer",
-                "Обновление до версии " + version + " установлено. Редактор перекомпилируется...",
-                "OK");
+            Debug.Log("[BSLK-Optimizer] Установлена версия " + version + ".");
             onStatus("Установлена версия " + version + ".");
             AssetDatabase.Refresh();
         }

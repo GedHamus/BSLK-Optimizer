@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
@@ -24,15 +25,20 @@ public static class BSLKClubRegression
     {
         try
         {
+            // VRChat projects use Linear color space; texture checks must hold there.
+            if (PlayerSettings.colorSpace != ColorSpace.Linear) PlayerSettings.colorSpace = ColorSpace.Linear;
             fixture = "Assets/ClubTest_" + Guid.NewGuid().ToString("N");
             AssetDatabase.CreateFolder("Assets", Path.GetFileName(fixture));
             ParticleBudget();
             PixelError();
             Slots();
+            ShaderTextures();
             SharedBones();
             CopyAndOutfit();
             Cancellation();
             AdaptiveTextures();
+            MergeAndDeduplicate();
+            Simplification();
             Debug.Log("BSLK REGRESSION PASSED: " + checks + " assertions");
             File.WriteAllText("test-results.txt", "PASSED: " + checks + " assertions");
             EditorApplication.Exit(0);
@@ -94,6 +100,19 @@ public static class BSLKClubRegression
         Object.DestroyImmediate(go);
     }
 
+    private static void ShaderTextures()
+    {
+        GameObject go = new GameObject("ShaderTextures");
+        go.AddComponent<MeshFilter>().sharedMesh = MakeMesh("shaderTextures");
+        Texture2D used = MakeTexture("UsedSlot", false), stale = MakeTexture("StaleSlot", false);
+        Material material = MakeMaterial("StaleMaterial", used);
+        material.SetTexture("_StaleTex", stale);
+        go.AddComponent<MeshRenderer>().sharedMaterial = material;
+        var textures = BSLKClubOptimizer.Textures(go);
+        Check(textures.Contains(used) && !textures.Contains(stale), "Texture budget counts shader properties only, not stale material slots");
+        Object.DestroyImmediate(go);
+    }
+
     private static void SharedBones()
     {
         GameObject root = new GameObject("SharedBones");
@@ -132,7 +151,7 @@ public static class BSLKClubRegression
         var root = new GameObject("Wardrobe");
         var material = MakeMaterial("WardrobeMaterial");
         MeshObject(root, "Shirt", material);
-        MeshObject(root, "Hidden", material).SetActive(false);
+        MeshObject(root, "Hidden", MakeMaterial("HiddenMaterial")).SetActive(false);
         AnimationClip clip = new AnimationClip { name = "Outfit" };
         AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve("Shirt", typeof(GameObject), "m_IsActive"), AnimationCurve.Constant(0, 1, 0));
         AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve("Hidden", typeof(GameObject), "m_IsActive"), AnimationCurve.Constant(0, 1, 1));
@@ -146,9 +165,16 @@ public static class BSLKClubRegression
         controller.AddParameter("Clothes", AnimatorControllerParameterType.Bool);
         AnimatorState state = controller.layers[1].stateMachine.AddState("Toggle");
         state.motion = clip;
+        state.writeDefaultValues = false;
         controller.layers[1].stateMachine.AddAnyStateTransition(state).AddCondition(AnimatorConditionMode.If, 0, "Clothes");
         root.AddComponent<Animator>().runtimeAnimatorController = controller;
         var ps = root.AddComponent<ParticleSystem>(); var main = ps.main; main.maxParticles = 9000;
+        // Not animatable in Unity 2022.3, but such dead bindings must not survive in the club copy.
+        EditorCurveBinding particleBinding = EditorCurveBinding.FloatCurve("", typeof(ParticleSystem), "InitialModule.maxNumParticles");
+        var particleClip = new AnimationClip { name = "Particles" };
+        AnimationUtility.SetEditorCurve(particleClip, particleBinding, AnimationCurve.Constant(0, 1, 9000));
+        AssetDatabase.CreateAsset(particleClip, fixture + "/particles.anim");
+        controller.layers[0].stateMachine.AddState("Particles").motion = particleClip;
         root.AddComponent<Light>();
         AssetDatabase.SaveAssets();
         string originalController = File.ReadAllText(fixture + "/Outfit.controller");
@@ -166,21 +192,130 @@ public static class BSLKClubRegression
         Check(copiedController != controller, "Animator controller copied");
         Check(copiedController.layers.Length == 2 && copiedController.layers[1].stateMachine.anyStateTransitions.Length == 0, "Clothing layer neutralized without renumbering");
         Check(AnimationUtility.GetCurveBindings(copiedController.layers[0].stateMachine.states[0].state.motion as AnimationClip).Length == 1, "Gesture curve retained");
+        Check(!copiedController.layers[1].stateMachine.defaultState.writeDefaultValues, "Neutralized layer keeps Write Defaults OFF");
+        var copiedParticles = (AnimationClip)copiedController.layers[0].stateMachine.states.First(s => s.state.name == "Particles").state.motion;
+        Check(copiedParticles != particleClip && AnimationUtility.GetCurveBindings(copiedParticles).Length == 0 &&
+            AnimationUtility.GetCurveBindings(particleClip).Length == 1, "maxParticles animation removed from copy only");
         Check(result.avatar.GetComponent<ParticleSystem>().main.maxParticles == 2000, "Club particle limit applied");
         Check(File.ReadAllText(fixture + "/Outfit.controller") == originalController && File.ReadAllText(fixture + "/outfit.anim") == originalClip, "Original controller/clip bytes unchanged");
         Check(AssetDatabase.LoadAssetAtPath<GameObject>(result.folder + "/Club.prefab") != null, "Club prefab persisted");
+        Check(result.avatar.name == "Wardrobe [BELKA]", "Generated avatar carries the BELKA suffix");
+        Check(Directory.GetFiles(result.folder, "HiddenMaterial*").Length == 0 && Directory.GetFiles(result.folder, "WardrobeMaterial*.mat").Length == 1,
+            "Materials of deleted clothing are not left in the result folder");
         bool refused = false;
         try { BSLKClubOptimizer.Create(result.avatar, new BSLKClubOptimizer.Options()); } catch (InvalidOperationException) { refused = true; }
         Check(refused, "Cannot repeatedly degrade generated avatar");
         Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
     }
 
-    private static Texture2D MakeTexture(string name, bool checker)
+    private static Mesh MakeSkin(string name, int quads, Transform bone, params string[] shapes)
+    {
+        var vertices = new List<Vector3>();
+        var triangles = new List<int>();
+        for (int q = 0; q < quads; q++)
+        {
+            int b = vertices.Count;
+            vertices.AddRange(new[] { new Vector3(q, 0, 0), new Vector3(q + 1, 0, 0), new Vector3(q, 1, 0), new Vector3(q + 1, 1, 0) });
+            triangles.AddRange(new[] { b, b + 2, b + 1, b + 1, b + 2, b + 3 });
+        }
+        var mesh = new Mesh { name = name };
+        mesh.SetVertices(vertices);
+        mesh.SetTriangles(triangles, 0);
+        mesh.RecalculateNormals();
+        mesh.boneWeights = vertices.Select(_ => new BoneWeight { boneIndex0 = 0, weight0 = 1 }).ToArray();
+        mesh.bindposes = new[] { bone.worldToLocalMatrix };
+        foreach (string shape in shapes) mesh.AddBlendShapeFrame(shape, 100, vertices.Select(_ => Vector3.up).ToArray(), null, null);
+        AssetDatabase.CreateAsset(mesh, fixture + "/" + name + ".asset");
+        return mesh;
+    }
+
+    private static SkinnedMeshRenderer Skin(Transform parent, string name, Mesh mesh, Transform bone, Material material)
+    {
+        var go = new GameObject(name); go.transform.SetParent(parent);
+        var renderer = go.AddComponent<SkinnedMeshRenderer>();
+        renderer.sharedMesh = mesh; renderer.bones = new[] { bone }; renderer.rootBone = bone; renderer.sharedMaterial = material;
+        return renderer;
+    }
+
+    private static void MergeAndDeduplicate()
+    {
+        var root = new GameObject("Merge");
+        var hips = new GameObject("Hips").transform; hips.SetParent(root.transform);
+        var jacket = new GameObject("Jacket").transform; jacket.SetParent(root.transform);
+        Material cloth = MakeMaterial("Cloth"), clothTwin = MakeMaterial("ClothTwin");
+        SkinnedMeshRenderer body = Skin(jacket, "Body", MakeSkin("JacketBody", 4, hips, "Used", "Unused", "Weighted"), hips, cloth);
+        body.SetBlendShapeWeight(2, 30);
+        Skin(jacket, "Zipper", MakeSkin("JacketZipper", 1, hips, "Open"), hips, clothTwin);
+        Texture2D a = MakeTexture("TwinA", false), b = MakeTexture("TwinB", false);
+        GameObject propA = MeshObject(root, "PropA", MakeMaterial("PropMatA", a)), propB = MeshObject(root, "PropB", MakeMaterial("PropMatB", b));
+        var multiMesh = new Mesh { name = "Multi", vertices = new[] { Vector3.zero, Vector3.right, Vector3.up, Vector3.one }, subMeshCount = 2 };
+        multiMesh.SetTriangles(new[] { 0, 1, 2 }, 0); multiMesh.SetTriangles(new[] { 1, 3, 2 }, 1);
+        GameObject multi = MeshObject(root, "Multi", cloth);
+        multi.GetComponent<MeshFilter>().sharedMesh = multiMesh;
+        multi.GetComponent<MeshRenderer>().sharedMaterials = new[] { cloth, clothTwin };
+        var clip = new AnimationClip { name = "Shapes" };
+        AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve("Jacket/Body", typeof(SkinnedMeshRenderer), "blendShape.Used"), AnimationCurve.Constant(0, 1, 100));
+        AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve("Jacket/Zipper", typeof(SkinnedMeshRenderer), "blendShape.Open"), AnimationCurve.Constant(0, 1, 100));
+        AssetDatabase.CreateAsset(clip, fixture + "/shapes.anim");
+        var controller = AnimatorController.CreateAnimatorControllerAtPath(fixture + "/Shapes.controller");
+        controller.layers[0].stateMachine.AddState("Shapes").motion = clip;
+        root.AddComponent<Animator>().runtimeAnimatorController = controller;
+        AssetDatabase.SaveAssets();
+
+        var result = BSLKClubOptimizer.Create(root, new BSLKClubOptimizer.Options { optimizeTextures = false });
+        Transform copy = result.avatar.transform;
+        var skins = copy.Find("Jacket").GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        Check(skins.Length == 1 && skins[0].sharedMaterials.Length == 1 && BSLKClubGeometry.TriangleCount(skins[0].sharedMesh) == 10,
+            "Jacket meshes merged into one renderer and one slot, triangles preserved");
+        Mesh merged = skins[0].sharedMesh;
+        Check(merged.GetBlendShapeIndex("Used") >= 0 && merged.GetBlendShapeIndex("Open") >= 0 && merged.GetBlendShapeIndex("Unused") < 0 &&
+            skins[0].GetBlendShapeWeight(merged.GetBlendShapeIndex("Weighted")) == 30, "Animated and weighted shapes kept, unused shape removed");
+        var copiedClip = (AnimationClip)((AnimatorController)result.avatar.GetComponent<Animator>().runtimeAnimatorController).layers[0].stateMachine.states[0].state.motion;
+        Check(AnimationUtility.GetCurveBindings(copiedClip).Count(x => x.path == "Jacket/Body") == 2 && AnimationUtility.GetCurveBindings(copiedClip).All(x => x.path != "Jacket/Zipper"),
+            "Blend shape animation follows the merged renderer");
+        Check(copy.Find("PropA").GetComponent<MeshRenderer>().sharedMaterial == copy.Find("PropB").GetComponent<MeshRenderer>().sharedMaterial &&
+            Directory.GetFiles(result.folder, "Twin*.png").Length == 1, "Identical textures and materials collapse to one copy");
+        Check(copy.Find("Multi").GetComponent<MeshRenderer>().sharedMaterials.Length == 1, "Slots with identical materials merged");
+        Check(root.transform.Find("Jacket").GetComponentsInChildren<SkinnedMeshRenderer>().Length == 2 && body.sharedMesh.blendShapeCount == 3 &&
+            root.transform.Find("Multi").GetComponent<MeshRenderer>().sharedMaterials.Length == 2, "Source meshes and slots unchanged");
+        var triangles = BSLKClubInsights.Collect(result.avatar).First(x => x.title == "Треугольники");
+        Check(triangles.items[0].label == "Jacket/Body" && triangles.total == 14, "Limit report names the largest contributor");
+        Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
+    }
+
+    private static void Simplification()
+    {
+        const int size = 30;
+        var vertices = new List<Vector3>();
+        var triangles = new List<int>();
+        for (int y = 0; y <= size; y++) for (int x = 0; x <= size; x++) vertices.Add(new Vector3(x, Mathf.Sin(x * 0.2f) * 0.1f, y));
+        for (int y = 0; y < size; y++) for (int x = 0; x < size; x++)
+        {
+            int i = y * (size + 1) + x;
+            triangles.AddRange(new[] { i, i + size + 1, i + 1, i + 1, i + size + 1, i + size + 2 });
+        }
+        var mesh = new Mesh { name = "Grid" };
+        mesh.SetVertices(vertices); mesh.SetTriangles(triangles, 0); mesh.RecalculateNormals();
+        mesh.AddBlendShapeFrame("Wave", 100, vertices.Select(v => Vector3.up).ToArray(), null, null);
+        Mesh simple = BSLKClubGeometry.Simplify(mesh, 0.3f, false);
+        int before = BSLKClubGeometry.TriangleCount(mesh), after = BSLKClubGeometry.TriangleCount(simple);
+        Check(after <= before * 0.5f && after > 0 && simple.vertexCount < mesh.vertexCount && simple.blendShapeCount == 1 &&
+            Mathf.Abs(simple.bounds.size.x - mesh.bounds.size.x) < 0.01f && Mathf.Abs(simple.bounds.size.z - mesh.bounds.size.z) < 0.01f, "Simplification: " + before + " → " + after + " triangles, border and shapes kept");
+        Mesh lockedShapes = BSLKClubGeometry.Simplify(mesh, 0.3f, true);
+        Check(BSLKClubGeometry.TriangleCount(lockedShapes) == before, "Vertices moved by blend shapes are not simplified when protected");
+    }
+
+    private static Texture2D MakeTexture(string name, bool checker, bool darkNoise = false)
     {
         var texture = new Texture2D(1024, 1024, TextureFormat.RGBA32, false);
         Color32[] pixels = new Color32[1024 * 1024];
+        var random = new System.Random(7);
         for (int y = 0; y < 1024; y++) for (int x = 0; x < 1024; x++)
-            pixels[y * 1024 + x] = checker ? ((x + y) % 2 == 0 ? new Color32(0, 0, 0, 255) : new Color32(255, 255, 255, 255)) : new Color32(128, 64, 32, 255);
+        {
+            byte v = (byte)random.Next(0, 41);
+            pixels[y * 1024 + x] = darkNoise ? new Color32(v, v, v, 255) :
+                checker ? ((x + y) % 2 == 0 ? new Color32(0, 0, 0, 255) : new Color32(255, 255, 255, 255)) : new Color32(128, 64, 32, 255);
+        }
         texture.SetPixels32(pixels); texture.Apply();
         string path = fixture + "/" + name + ".png";
         File.WriteAllBytes(path, texture.EncodeToPNG()); Object.DestroyImmediate(texture);
@@ -208,9 +343,14 @@ public static class BSLKClubRegression
     {
         GameObject root = new GameObject("Textures");
         Texture2D flat = MakeTexture("Flat", false), detail = MakeTexture("Detail", true), protect = MakeTexture("Protected", false);
+        Texture2D dark = MakeTexture("DarkDetail", false, true);
+        Color32 sample = BSLKClubTextures.Readback(flat, 1024, 1024)[0];
+        Check(Math.Abs(sample.r - 128) <= 2 && Math.Abs(sample.g - 64) <= 2 && Math.Abs(sample.b - 32) <= 2,
+            "Readback compares sRGB values in a Linear project: " + sample);
         MeshObject(root, "Flat", MakeMaterial("FlatMat", flat));
         MeshObject(root, "Detail", MakeMaterial("DetailMat", detail));
         MeshObject(root, "Protected", MakeMaterial("ProtectedMat", protect));
+        MeshObject(root, "Dark", MakeMaterial("DarkMat", dark));
         var options = new BSLKClubOptimizer.Options { minimumTextureSize = 256 };
         options.protectedTextures.Add(protect);
         string originalMeta = File.ReadAllText(AssetDatabase.GetAssetPath(flat) + ".meta");
@@ -221,6 +361,8 @@ public static class BSLKClubRegression
         Check(flatCopy != flat && flatCopy.width == 256, "Flat texture reduced below budget to chosen minimum");
         Check(detailCopy.width == 1024, "High-frequency detail rejects destructive resize");
         Check(protectCopy.width == 1024, "Protected texture retains resolution");
+        Texture darkCopy = result.avatar.transform.Find("Dark").GetComponent<MeshRenderer>().sharedMaterial.mainTexture;
+        Check(darkCopy.width == 1024, "Dark detail is judged perceptually and is not downscaled");
         Check(flat.width == 1024 && File.ReadAllText(AssetDatabase.GetAssetPath(flat) + ".meta") == originalMeta, "Source texture importer unchanged");
         Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
     }

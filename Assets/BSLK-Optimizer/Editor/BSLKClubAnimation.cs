@@ -14,6 +14,126 @@ namespace BSLK.Optimizer
         // Mixed toggles retain their other actions (gestures, blendshapes, sounds, etc.).
         internal static void FreezeBuildToggles(BSLKClubOptimizer.Context context)
         {
+            ResolveOutfitToggles(context);
+            PruneActions(context, (type, action) =>
+            {
+                if (type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal))
+                {
+                    GameObject target = action.FindPropertyRelative("obj")?.objectReferenceValue as GameObject;
+                    return target != null && context.fixedVisibility.Contains(AnimationUtility.CalculateTransformPath(target.transform, context.avatar.transform));
+                }
+                if (type.EndsWith(" VF.Model.StateAction.MaterialAction", StringComparison.Ordinal))
+                {
+                    Renderer target = action.FindPropertyRelative("renderer")?.objectReferenceValue as Renderer;
+                    return target != null && context.rendererPaths.Contains(AnimationUtility.CalculateTransformPath(target.transform, context.avatar.transform));
+                }
+                return false;
+            }, "VRCFury: удалено действий переключения одежды {0}, пустых переключателей {1}.");
+        }
+
+        // A clothing toggle (object actions, optionally with body blend shapes such as shrink keys)
+        // is resolved from the scene state the user selected. Selected ON: its blend shapes are
+        // baked into the renderers and the menu toggle disappears. Selected OFF: the whole toggle,
+        // including its shrink keys, is removed. Toggles with other work or unclear state are kept.
+        private static void ResolveOutfitToggles(BSLKClubOptimizer.Context context)
+        {
+            int baked = 0, removed = 0;
+            foreach (Component component in context.avatar.GetComponentsInChildren<Component>(true))
+            {
+                if (component == null || component.GetType().FullName != "VF.Model.VRCFury") continue;
+                bool? selected = null;
+                var shapes = new List<KeyValuePair<Renderer, KeyValuePair<string, float>>>();
+                using (var serialized = new SerializedObject(component))
+                {
+                    SerializedProperty content = serialized.FindProperty("content");
+                    SerializedProperty legacy = serialized.FindProperty("config.features");
+                    if (content == null || content.propertyType != SerializedPropertyType.ManagedReference ||
+                        !content.managedReferenceFullTypename.EndsWith(" VF.Model.Feature.Toggle", StringComparison.Ordinal) ||
+                        (legacy != null && legacy.arraySize != 0)) continue;
+                    if (Flag(content, "enableDriveGlobalParam") || Flag(content, "useGlobalParam") || Flag(content, "slider") || Flag(content, "separateLocal")) continue;
+                    SerializedProperty actions = content.FindPropertyRelative("state.actions");
+                    if (actions == null || !actions.isArray) continue;
+                    bool unclear = false, other = false;
+                    for (int i = 0; i < actions.arraySize; i++)
+                    {
+                        SerializedProperty action = actions.GetArrayElementAtIndex(i);
+                        string type = action.propertyType == SerializedPropertyType.ManagedReference ? action.managedReferenceFullTypename : "";
+                        if (type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal))
+                        {
+                            GameObject target = action.FindPropertyRelative("obj")?.objectReferenceValue as GameObject;
+                            if (target == null || !target.transform.IsChildOf(context.avatar.transform)) { unclear = true; continue; }
+                            // VRCFury modes: 0 TurnOn, 1 TurnOff, 2 Toggle (ON inverts the current state).
+                            int mode = action.FindPropertyRelative("mode")?.enumValueIndex ?? 0;
+                            bool on = mode == 0 ? target.activeInHierarchy : mode == 1 ? !target.activeInHierarchy : false;
+                            if (selected == null) selected = on;
+                            else if (selected != on) unclear = true;
+                        }
+                        else if (type.EndsWith(" VF.Model.StateAction.BlendShapeAction", StringComparison.Ordinal))
+                        {
+                            string name = action.FindPropertyRelative("blendShape")?.stringValue;
+                            float value = action.FindPropertyRelative("blendShapeValue")?.floatValue ?? 100;
+                            Renderer renderer = Flag(action, "allRenderers") ? null : action.FindPropertyRelative("renderer")?.objectReferenceValue as Renderer;
+                            if (string.IsNullOrEmpty(name)) continue;
+                            shapes.Add(new KeyValuePair<Renderer, KeyValuePair<string, float>>(renderer, new KeyValuePair<string, float>(name, value)));
+                        }
+                        else other = true;
+                    }
+                    if (unclear || selected == null) continue;
+                    // A selected toggle with clips, materials, sounds etc. cannot be baked safely.
+                    if (selected == true && other) continue;
+                }
+                if (selected == true)
+                {
+                    foreach (var shape in shapes) BakeBlendShape(context.avatar, shape.Key, shape.Value.Key, shape.Value.Value);
+                    baked++;
+                }
+                else removed++;
+                Object.DestroyImmediate(component);
+            }
+            context.notes.Add("VRCFury: выбранных переключателей одежды закреплено " + baked + " (их blend shapes применены), невыбранных удалено " + removed + ".");
+        }
+
+        private static bool Flag(SerializedProperty parent, string name)
+        {
+            SerializedProperty property = parent.FindPropertyRelative(name);
+            return property != null && property.propertyType == SerializedPropertyType.Boolean && property.boolValue;
+        }
+
+        // VRCFury applies an "all renderers" blend shape to every renderer that has it.
+        private static void BakeBlendShape(GameObject avatar, Renderer target, string name, float value)
+        {
+            IEnumerable<SkinnedMeshRenderer> renderers = target != null
+                ? new[] { target as SkinnedMeshRenderer }
+                : avatar.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            foreach (SkinnedMeshRenderer renderer in renderers)
+            {
+                int index = renderer != null && renderer.sharedMesh != null ? renderer.sharedMesh.GetBlendShapeIndex(name) : -1;
+                if (index >= 0) renderer.SetBlendShapeWeight(index, value);
+            }
+        }
+
+        // Any action (toggle, material, blend shape, flipbook, ...) that references an object about
+        // to be deleted can do no useful work and would reach the build with a missing target.
+        internal static void RemoveActionsForDeleted(BSLKClubOptimizer.Context context, HashSet<GameObject> deleted)
+        {
+            if (deleted.Count == 0) return;
+            PruneActions(context, (type, action) =>
+            {
+                SerializedProperty property = action.Copy();
+                SerializedProperty end = action.GetEndProperty();
+                while (property.Next(true) && !SerializedProperty.EqualContents(property, end))
+                {
+                    if (property.propertyType != SerializedPropertyType.ObjectReference) continue;
+                    Object reference = property.objectReferenceValue;
+                    GameObject target = reference as GameObject ?? (reference as Component)?.gameObject;
+                    if (target != null && deleted.Contains(target)) return true;
+                }
+                return false;
+            }, "VRCFury: удалено действий, направленных на удалённые объекты, {0}; опустевших переключателей {1}.");
+        }
+
+        private static void PruneActions(BSLKClubOptimizer.Context context, Func<string, SerializedProperty, bool> shouldRemove, string note)
+        {
             int actionsRemoved = 0, togglesRemoved = 0;
             foreach (Component component in context.avatar.GetComponentsInChildren<Component>(true))
             {
@@ -34,19 +154,7 @@ namespace BSLK.Optimizer
                         {
                             SerializedProperty action = actions.GetArrayElementAtIndex(i);
                             if (action.propertyType != SerializedPropertyType.ManagedReference) { remaining++; continue; }
-                            string type = action.managedReferenceFullTypename;
-                            bool remove = false;
-                            if (type.EndsWith(" VF.Model.StateAction.ObjectToggleAction", StringComparison.Ordinal))
-                            {
-                                GameObject target = action.FindPropertyRelative("obj")?.objectReferenceValue as GameObject;
-                                remove = target != null && context.fixedVisibility.Contains(AnimationUtility.CalculateTransformPath(target.transform, context.avatar.transform));
-                            }
-                            if (type.EndsWith(" VF.Model.StateAction.MaterialAction", StringComparison.Ordinal))
-                            {
-                                Renderer target = action.FindPropertyRelative("renderer")?.objectReferenceValue as Renderer;
-                                remove = target != null && context.rendererPaths.Contains(AnimationUtility.CalculateTransformPath(target.transform, context.avatar.transform));
-                            }
-                            if (remove)
+                            if (shouldRemove(action.managedReferenceFullTypename, action))
                             {
                                 actions.DeleteArrayElementAtIndex(i);
                                 changed = true;
@@ -68,7 +176,7 @@ namespace BSLK.Optimizer
                 }
                 if (destroy) { Object.DestroyImmediate(component); togglesRemoved++; }
             }
-            context.notes.Add("VRCFury: удалено действий переключения одежды " + actionsRemoved + ", пустых переключателей " + togglesRemoved + ".");
+            context.notes.Add(string.Format(note, actionsRemoved, togglesRemoved));
         }
 
         internal static void PruneEmptyLayersAndMenus(BSLKClubOptimizer.Context context)
@@ -86,12 +194,16 @@ namespace BSLK.Optimizer
                     AnimatorControllerLayer layer = controller.layers[i];
                     if (!Empty(layer.stateMachine) || !Changed(layer.stateMachine, context.modifiedClips)) continue;
                     CollectParameters(layer.stateMachine, candidates);
+                    // A new state defaults to Write Defaults ON; mixing it into a WD OFF avatar breaks animation.
+                    bool writeDefaults = WriteDefaults(layer.stateMachine, controller);
                     // Keep the layer index: SDK layer-control behaviours can address it by number.
                     foreach (ChildAnimatorState state in layer.stateMachine.states) layer.stateMachine.RemoveState(state.state);
                     foreach (ChildAnimatorStateMachine child in layer.stateMachine.stateMachines) layer.stateMachine.RemoveStateMachine(child.stateMachine);
                     layer.stateMachine.anyStateTransitions = new AnimatorStateTransition[0];
                     layer.stateMachine.entryTransitions = new AnimatorTransition[0];
-                    layer.stateMachine.defaultState = layer.stateMachine.AddState("Club fixed outfit");
+                    AnimatorState fixedState = layer.stateMachine.AddState("Club fixed outfit");
+                    fixedState.writeDefaultValues = writeDefaults;
+                    layer.stateMachine.defaultState = fixedState;
                     removedLayers++;
                 }
             }
@@ -133,6 +245,20 @@ namespace BSLK.Optimizer
                 }
             }
             context.notes.Add("Очищено слоёв одежды с сохранением индексов: " + removedLayers + "; убрано связанных кнопок/переключателей меню: " + removedControls + ". Общие параметры сохранены.");
+        }
+
+        // The layer's own default state decides; otherwise the controller's prevailing setting.
+        private static bool WriteDefaults(AnimatorStateMachine layer, AnimatorController controller)
+        {
+            if (layer.defaultState != null) return layer.defaultState.writeDefaultValues;
+            List<AnimatorState> states = States(layer).ToList();
+            if (states.Count == 0) states = controller.layers.SelectMany(l => States(l.stateMachine)).ToList();
+            return states.Count == 0 || states.Count(s => s.writeDefaultValues) * 2 > states.Count;
+        }
+
+        private static IEnumerable<AnimatorState> States(AnimatorStateMachine machine)
+        {
+            return machine.states.Select(s => s.state).Concat(machine.stateMachines.SelectMany(child => States(child.stateMachine)));
         }
 
         private static bool Changed(AnimatorStateMachine machine, HashSet<AnimationClip> changed)

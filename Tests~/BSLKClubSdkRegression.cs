@@ -34,6 +34,13 @@ public static class BSLKClubSdkRegression
             var state = controller.layers[1].stateMachine.AddState("Clothing"); state.motion = clip;
             controller.layers[1].stateMachine.AddAnyStateTransition(state).AddCondition(AnimatorConditionMode.If, 0, "Clothes");
             root.AddComponent<Animator>().runtimeAnimatorController = controller;
+            // Layers as the SDK inspector initializes them; build plugins such as VRCFury require them.
+            Func<VRCAvatarDescriptor.AnimLayerType, VRCAvatarDescriptor.CustomAnimLayer> layer = type => new VRCAvatarDescriptor.CustomAnimLayer { type = type, isDefault = true };
+            descriptor.customizeAnimationLayers = true;
+            descriptor.baseAnimationLayers = new[] { layer(VRCAvatarDescriptor.AnimLayerType.Base), layer(VRCAvatarDescriptor.AnimLayerType.Additive),
+                layer(VRCAvatarDescriptor.AnimLayerType.Gesture), layer(VRCAvatarDescriptor.AnimLayerType.Action),
+                new VRCAvatarDescriptor.CustomAnimLayer { type = VRCAvatarDescriptor.AnimLayerType.FX, animatorController = controller } };
+            descriptor.specialAnimationLayers = new[] { layer(VRCAvatarDescriptor.AnimLayerType.Sitting), layer(VRCAvatarDescriptor.AnimLayerType.TPose), layer(VRCAvatarDescriptor.AnimLayerType.IKPose) };
             var menu = ScriptableObject.CreateInstance<VRCExpressionsMenu>();
             menu.controls.Add(new VRCExpressionsMenu.Control { name = "Clothes", type = VRCExpressionsMenu.Control.ControlType.Toggle,
                 parameter = new VRCExpressionsMenu.Control.Parameter { name = "Clothes" } });
@@ -45,7 +52,13 @@ public static class BSLKClubSdkRegression
             var boneRoot = new GameObject("Hair"); boneRoot.transform.SetParent(root.transform);
             var boneChild = new GameObject("HairChild"); boneChild.transform.SetParent(boneRoot.transform); boneChild.transform.localPosition = Vector3.up;
             var boneLeaf = new GameObject("HairLeaf"); boneLeaf.transform.SetParent(boneChild.transform); boneLeaf.transform.localPosition = Vector3.up;
+            // Disabled wardrobe under an active PhysBone chain is not a bone; a bare disabled bone is.
+            var hat = new GameObject("Hat"); hat.transform.SetParent(boneChild.transform);
+            hat.AddComponent<MeshFilter>().sharedMesh = mesh; hat.AddComponent<MeshRenderer>(); hat.SetActive(false);
+            var spare = new GameObject("SpareBone"); spare.transform.SetParent(boneLeaf.transform); spare.SetActive(false);
+            var ignored = new GameObject("Ignored"); ignored.transform.SetParent(boneRoot.transform); ignored.SetActive(false);
             var physBone = boneRoot.AddComponent<VRCPhysBone>(); physBone.rootTransform = boneRoot.transform;
+            physBone.ignoreTransforms.Add(ignored.transform);
             var collider = root.AddComponent<VRCPhysBoneCollider>();
             physBone.colliders.Clear();
             physBone.colliders.Add(collider); physBone.colliders.Add(null); physBone.colliders.Add(collider);
@@ -58,6 +71,27 @@ public static class BSLKClubSdkRegression
             object toggleState = toggleContent.GetType().GetField("state").GetValue(toggleContent);
             ((System.Collections.IList)toggleState.GetType().GetField("actions").GetValue(toggleState)).Add(action);
             furyType.GetField("content").SetValue(toggle, toggleContent);
+            // A toggle whose only target is a deleted non-renderer object must not survive with a missing target.
+            var effect = new GameObject("Effect"); effect.transform.SetParent(root.transform); effect.SetActive(false);
+            Component effectToggle = root.AddComponent(furyType);
+            object effectContent = Activator.CreateInstance(FindType("VF.Model.Feature.Toggle"), true);
+            object effectAction = Activator.CreateInstance(FindType("VF.Model.StateAction.ObjectToggleAction"), true);
+            effectAction.GetType().GetField("obj").SetValue(effectAction, effect);
+            object effectState = effectContent.GetType().GetField("state").GetValue(effectContent);
+            ((System.Collections.IList)effectState.GetType().GetField("actions").GetValue(effectState)).Add(effectAction);
+            furyType.GetField("content").SetValue(effectToggle, effectContent);
+            // Body with shrink keys: the worn shirt's shrink is baked, the removed jacket's is not.
+            var bodyMesh = new Mesh { vertices = new[] { Vector3.zero, Vector3.right, Vector3.up }, triangles = new[] { 0, 1, 2 } };
+            foreach (string shape in new[] { "Shrink", "ShrinkJ", "Smile" }) bodyMesh.AddBlendShapeFrame(shape, 100, new Vector3[3], null, null);
+            var body = new GameObject("Body"); body.transform.SetParent(root.transform);
+            var bodyRenderer = body.AddComponent<SkinnedMeshRenderer>(); bodyRenderer.sharedMesh = bodyMesh;
+            ((System.Collections.IList)toggleState.GetType().GetField("actions").GetValue(toggleState)).Add(ShapeAction("Shrink"));
+            var jacketMaterial = new Material(Shader.Find("Standard"));
+            AssetDatabase.CreateAsset(jacketMaterial, fixture + "/JacketMat.mat");
+            var jacket = new GameObject("Jacket"); jacket.transform.SetParent(root.transform);
+            jacket.AddComponent<MeshFilter>().sharedMesh = mesh; jacket.AddComponent<MeshRenderer>().sharedMaterial = jacketMaterial; jacket.SetActive(false);
+            AddToggle(root, furyType, ObjectAction(jacket), ShapeAction("ShrinkJ"));
+            AddToggle(root, furyType, ShapeAction("Smile"));
             Component sps = root.AddComponent(furyType);
             furyType.GetField("content").SetValue(sps, Activator.CreateInstance(FindType("VF.Model.Feature.SpsOptions"), true));
             if (!BSLKClubSdk.TryRead(root, out var before, out var reason)) throw new Exception("SDK stats unavailable: " + reason);
@@ -66,13 +100,46 @@ public static class BSLKClubSdkRegression
             if (!BSLKClubSdk.TryRead(result.avatar, out var after, out reason)) throw new Exception("SDK stats after copy unavailable: " + reason);
             var copiedBone = result.avatar.GetComponentInChildren<VRCPhysBone>();
             if (copiedBone.colliders.Count != 1 || physBone.colliders.Count != 3) throw new Exception("PhysBone cleanup/isolation failed");
-            if (result.avatar.GetComponents(furyType).Length != 0 || root.GetComponents(furyType).Length != 2)
+            if (copiedBone.ignoreTransforms.Count != 0 || physBone.ignoreTransforms.Count != 1) throw new Exception("Missing ignoreTransforms entry left behind");
+            var copiedBody = result.avatar.transform.Find("Body").GetComponent<SkinnedMeshRenderer>();
+            Mesh copiedBodyMesh = copiedBody.sharedMesh;
+            // ShrinkJ belonged only to the removed jacket toggle, so the unused shape is dropped as well.
+            if (copiedBody.GetBlendShapeWeight(copiedBodyMesh.GetBlendShapeIndex("Shrink")) != 100 || copiedBodyMesh.GetBlendShapeIndex("ShrinkJ") >= 0 ||
+                copiedBody.GetBlendShapeWeight(copiedBodyMesh.GetBlendShapeIndex("Smile")) != 0 ||
+                bodyRenderer.GetBlendShapeWeight(0) != 0 || bodyMesh.blendShapeCount != 3 || result.avatar.transform.Find("Jacket") != null)
+                throw new Exception("Selected outfit toggle was not baked, or the removed one was applied");
+            if (Directory.GetFiles(result.folder, "JacketMat*").Length != 0) throw new Exception("Material of deleted jacket left in result");
+            if (result.avatar.GetComponents(furyType).Length != 1 || root.GetComponents(furyType).Length != 5)
                 throw new Exception("VRCFury clothing/SPS cleanup or source isolation failed");
+            if (result.avatar.transform.Find("Hair/HairChild/Hat") != null || result.avatar.transform.Find("Hair/Ignored") != null ||
+                result.avatar.transform.Find("Hair/HairChild/HairLeaf/SpareBone") == null || root.transform.Find("Hair/HairChild/Hat") == null)
+                throw new Exception("PhysBone chain protection kept disabled wardrobe or dropped a bare bone: " + string.Join(", ",
+                    result.avatar.GetComponentsInChildren<Transform>(true).Select(t => AnimationUtility.CalculateTransformPath(t, result.avatar.transform))));
+            if (Directory.GetFiles(result.folder, "*Icon.png").Length != 0 || BSLKClubOptimizer.Textures(result.avatar).Count != 0)
+                throw new Exception("Script icons were copied or counted as avatar textures");
             var copiedMenu = result.avatar.GetComponent<VRCAvatarDescriptor>().expressionsMenu;
             if (copiedMenu == menu || menu.controls.Count != 2 || copiedMenu.controls.Count != 1 || copiedMenu.controls[0].name != "Gesture")
                 throw new Exception("Expression menu cleanup/isolation failed: " + copiedMenu.controls.Count);
             Debug.Log("SDK AFTER: collisions=" + after.collisions + " triangles=" + after.triangles);
-            Debug.Log("BSLK SDK REGRESSION PASSED: real SDK stats, PhysBone links, menu cleanup, VRCFury toggles/SPS, source isolation");
+
+            // Collision plan: the suggestion picks the chain, and only the club copy loses its colliders.
+            var plan = BSLKClubInsights.PhysBones(root);
+            var suggested = BSLKClubInsights.Suggest(plan, 0);
+            if (!suggested.Contains("Hair#0") || plan.First(e => e.key == "Hair#0").colliders != 1) throw new Exception("PhysBone collision plan failed");
+            var stripOptions = new BSLKClubOptimizer.Options { optimizeTextures = false };
+            stripOptions.stripColliders.UnionWith(suggested);
+            var stripped = BSLKClubOptimizer.Create(root, stripOptions);
+            if (stripped.avatar.GetComponentInChildren<VRCPhysBone>().colliders.Count != 0 || physBone.colliders.Count != 3)
+                throw new Exception("Selected PhysBone colliders were not stripped from the copy only");
+
+            // Build check: VRCFury processes a temporary clone; the result itself keeps its components.
+            int roots = root.scene.rootCount;
+            if (!BSLKClubSdk.TryAnalyzeBuilt(result.avatar, out string built, out string buildReason)) throw new Exception("Build check failed: " + buildReason);
+            if (!built.Contains("ПОСЛЕ СБОРКИ") || result.avatar.GetComponents(furyType).Length != 1 || root.scene.rootCount != roots)
+                throw new Exception("Build check changed the result or left a clone behind");
+            Debug.Log("BUILD CHECK:\n" + built);
+            Object.DestroyImmediate(stripped.avatar);
+            Debug.Log("BSLK SDK REGRESSION PASSED: real SDK stats, PhysBone links, chain and collision plan, menu cleanup, VRCFury toggles/SPS/missing targets, script icons, build check, source isolation");
             File.WriteAllText("sdk-test-results.txt", "PASSED: SDK integration, PhysBone, expression menus, VRCFury toggles/SPS");
             Object.DestroyImmediate(root); Object.DestroyImmediate(result.avatar);
             EditorApplication.Exit(0);
@@ -83,6 +150,30 @@ public static class BSLKClubSdkRegression
             File.WriteAllText("sdk-test-results.txt", "FAILED: " + e);
             EditorApplication.Exit(1);
         }
+    }
+
+    private static object ObjectAction(GameObject target)
+    {
+        object action = Activator.CreateInstance(FindType("VF.Model.StateAction.ObjectToggleAction"), true);
+        action.GetType().GetField("obj").SetValue(action, target);
+        return action;
+    }
+
+    private static object ShapeAction(string shape)
+    {
+        object action = Activator.CreateInstance(FindType("VF.Model.StateAction.BlendShapeAction"), true);
+        action.GetType().GetField("blendShape").SetValue(action, shape);
+        return action;
+    }
+
+    private static Component AddToggle(GameObject root, Type furyType, params object[] actions)
+    {
+        Component toggle = root.AddComponent(furyType);
+        object content = Activator.CreateInstance(FindType("VF.Model.Feature.Toggle"), true);
+        object state = content.GetType().GetField("state").GetValue(content);
+        foreach (object action in actions) ((System.Collections.IList)state.GetType().GetField("actions").GetValue(state)).Add(action);
+        furyType.GetField("content").SetValue(toggle, content);
+        return toggle;
     }
 
     private static Type FindType(string name)

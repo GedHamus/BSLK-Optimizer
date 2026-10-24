@@ -14,6 +14,7 @@ namespace BSLK.Optimizer
     public static class BSLKClubOptimizer
     {
         public const string OutputRoot = "Assets/BSLK-Optimizer-Generated";
+        public const string Suffix = "BELKA";
         public const long TriangleLimit = 500000;
         public const int SlotLimit = 50, ParticleLimit = 2000, CollisionLimit = 1500;
         public const long TextureLimit = 150L * 1024 * 1024;
@@ -25,6 +26,13 @@ namespace BSLK.Optimizer
             public bool limitParticles = true;
             public int minimumTextureSize = 512;
             public float textureError = 0.02f;
+            public bool mergeTextures = true;
+            public bool mergeMaterials = true;
+            public bool mergeMeshes = true;
+            public bool removeUnusedShapesAndBones = true;
+            public bool keepMmdShapes = true;
+            // PhysBones whose colliders are dropped: "path#index" keys from BSLKClubInsights.PhysBones.
+            public readonly HashSet<string> stripColliders = new HashSet<string>();
             public System.Threading.CancellationToken cancellationToken;
             public readonly HashSet<Texture> protectedTextures = new HashSet<Texture>();
         }
@@ -76,7 +84,7 @@ namespace BSLK.Optimizer
                 if (string.IsNullOrEmpty(folderGuid)) throw new IOException("Не удалось создать папку результата.");
                 context.ownsFolder = true;
                 context.avatar = Object.Instantiate(source, source.transform.parent);
-                context.avatar.name = source.name + " [Club]";
+                context.avatar.name = source.name + " [" + Suffix + "]";
                 if (PrefabUtility.IsPartOfPrefabInstance(context.avatar))
                     PrefabUtility.UnpackPrefabInstance(context.avatar, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
                 options.cancellationToken.ThrowIfCancellationRequested();
@@ -99,6 +107,15 @@ namespace BSLK.Optimizer
                 BSLKOptimizer.RemoveEmptyMaterialSlots(context.avatar);
                 CleanPhysBoneLinks(context);
                 if (options.limitParticles) LimitParticles(context);
+                // Duplicate textures first: materials that differ only by duplicate files then merge too.
+                if (options.mergeTextures) BSLKClubMaterials.MergeDuplicateTextures(context, options.protectedTextures);
+                if (options.mergeMaterials) BSLKClubMaterials.MergeIdenticalMaterials(context);
+                HashSet<Renderer> locked = LockedRenderers(context);
+                if (options.mergeMeshes) BSLKClubGeometry.MergeClothing(context.avatar, locked, ClubClips(context), mesh => SaveMesh(context, mesh), context.notes);
+                if (options.mergeMaterials)
+                    context.notes.Add("Объединено слотов с одинаковым материалом: " + BSLKClubGeometry.MergeDuplicateSlots(context.avatar, locked, mesh => SaveMesh(context, mesh)) + ".");
+                if (options.removeUnusedShapesAndBones) RemoveUnusedShapesAndBones(context, options);
+                StripColliders(context, options.stripColliders);
                 if (options.optimizeTextures) BSLKClubTextures.Optimize(context, options);
 
                 // Persist all data to a prefab; a successful result never relies on transient mesh instances.
@@ -111,10 +128,12 @@ namespace BSLK.Optimizer
                 if (PrefabUtility.SaveAsPrefabAssetAndConnect(context.avatar, prefabPath, InteractionMode.AutomatedAction) == null)
                     throw new InvalidOperationException("Не удалось сохранить клубный prefab.");
                 Undo.RegisterCreatedObjectUndo(context.avatar, "Создать клубный аватар");
+                RemoveUnusedCopies(context, prefabPath);
                 context.notes.Add("Исходный аватар не изменён. Копия и её ассеты: " + context.folder);
                 context.notes.Add("Сравните исходник и Club, включая лицо, одежду и мимику. Перед загрузкой проверьте итог в VRChat SDK.");
-                string report = "ДО\n" + before + "\n\nПОСЛЕ\n" + Analyze(context.avatar) +
-                    "\n\nИЗМЕНЕНИЯ И ЗАМЕЧАНИЯ\n" + string.Join("\n", context.notes);
+                string report = "BSLK Optimizer " + BSLKOptimizer.Version + " • автор GedHamus\n\nДО\n" + before + "\n\nПОСЛЕ\n" + Analyze(context.avatar) +
+                    "\n\nИЗМЕНЕНИЯ И ЗАМЕЧАНИЯ\n" + string.Join("\n", context.notes) +
+                    "\n\nКТО ЗАНИМАЕТ ЛИМИТЫ (ПОСЛЕ)\n" + BSLKClubInsights.Format(BSLKClubInsights.Collect(context.avatar));
                 File.WriteAllText(context.folder + "/Report.txt", report);
                 AssetDatabase.Refresh();
                 Selection.activeGameObject = context.avatar;
@@ -133,6 +152,19 @@ namespace BSLK.Optimizer
             finally { EditorUtility.ClearProgressBar(); }
         }
 
+        // The asset graph is copied before outfit removal; drop what the saved prefab no longer uses
+        // (materials of deleted clothing, animation-swap materials, their textures, unused model meshes).
+        private static void RemoveUnusedCopies(Context c, string prefabPath)
+        {
+            var used = new HashSet<string>(AssetDatabase.GetDependencies(prefabPath, true));
+            string[] unused = c.copiedPaths.Where(path => !used.Contains(path) && AssetDatabase.LoadMainAssetAtPath(path) != null).ToArray();
+            int materials = unused.Count(path => AssetDatabase.GetMainAssetTypeAtPath(path) == typeof(Material));
+            var failed = new List<string>();
+            if (unused.Length > 0) AssetDatabase.DeleteAssets(unused, failed);
+            c.copiedPaths.ExceptWith(unused.Except(failed));
+            c.notes.Add("Удалено неиспользуемых копий ассетов: " + (unused.Length - failed.Count) + ", из них материалов " + materials + ".");
+        }
+
         internal static void Progress(string message, float progress)
         {
             if (EditorUtility.DisplayCancelableProgressBar("Клубный аватар", message, progress))
@@ -147,13 +179,14 @@ namespace BSLK.Optimizer
             return string.IsNullOrWhiteSpace(name) ? "Avatar" : name;
         }
 
-        private static IEnumerable<Object> References(Object target)
+        internal static IEnumerable<Object> References(Object target, Func<string, bool> skipPath = null)
         {
             using (SerializedObject serialized = new SerializedObject(target))
             {
                 SerializedProperty property = serialized.GetIterator();
                 while (property.Next(true))
-                    if (property.propertyType == SerializedPropertyType.ObjectReference && property.objectReferenceValue != null)
+                    if (property.propertyType == SerializedPropertyType.ObjectReference && property.objectReferenceValue != null &&
+                        (skipPath == null || !skipPath(property.propertyPath)))
                         yield return property.objectReferenceValue;
             }
         }
@@ -216,7 +249,7 @@ namespace BSLK.Optimizer
                     if (!string.IsNullOrEmpty(path)) roots.Add(path);
                 }
             }
-            string[] dependencies = AssetDatabase.GetDependencies(roots.ToArray(), true);
+            string[] dependencies = Dependencies(roots);
             for (int i = 0; i < dependencies.Length; i++)
             {
                 string path = dependencies[i];
@@ -284,6 +317,162 @@ namespace BSLK.Optimizer
                 if (!(copy is Texture) && !(copy is Mesh)) Remap(copy, c.copies);
         }
 
+        // Recursive dependencies, but not through scripts, plugin DLLs (SDK classes live there)
+        // or shaders: their editor icons and default textures are not avatar assets.
+        private static string[] Dependencies(IEnumerable<string> roots)
+        {
+            var result = new List<string>();
+            var seen = new HashSet<string>();
+            var pending = new Queue<string>(roots);
+            while (pending.Count > 0)
+            {
+                string path = pending.Dequeue();
+                if (!seen.Add(path)) continue;
+                Type type = AssetDatabase.GetMainAssetTypeAtPath(path);
+                if (type == typeof(MonoScript) || AssetImporter.GetAtPath(path) is PluginImporter) continue;
+                result.Add(path);
+                if (type == typeof(Shader) || type == typeof(ComputeShader)) continue;
+                foreach (string dependency in AssetDatabase.GetDependencies(path, false)) pending.Enqueue(dependency);
+            }
+            return result.ToArray();
+        }
+
+        // Points every component of the copy and every result-owned asset at the replacement objects.
+        internal static void RemapAll(Context c, Dictionary<Object, Object> map)
+        {
+            foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
+                if (component != null) Remap(component, map);
+            foreach (Object copy in c.copies.Values.Distinct())
+                if (copy != null && !(copy is Texture) && !(copy is Mesh)) Remap(copy, map);
+        }
+
+        internal static Mesh SaveMesh(Context c, Mesh mesh)
+        {
+            string path = AssetDatabase.GenerateUniqueAssetPath(c.folder + "/" + SafeName(mesh.name) + ".asset");
+            AssetDatabase.CreateAsset(mesh, path);
+            c.copiedPaths.Add(path);
+            return mesh;
+        }
+
+        private static ICollection<AnimationClip> ClubClips(Context c)
+        {
+            return c.copies.Values.OfType<AnimationClip>().Distinct().Where(clip => !c.nestedClips.Contains(clip)).ToList();
+        }
+
+        // Renderers whose identity, slots or visibility something else depends on: referenced by
+        // components (visemes, eyelids, VRCFury actions, particle shapes), animated other than through
+        // blend shapes, toggled below their clothing item, or driven by a nested Animator.
+        private static HashSet<Renderer> LockedRenderers(Context c)
+        {
+            var locked = new HashSet<Renderer>();
+            Transform root = c.avatar.transform;
+            foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
+            {
+                if (component == null || component is Transform || component is Renderer || component is MeshFilter) continue;
+                foreach (Object reference in References(component)) if (reference is Renderer renderer) locked.Add(renderer);
+            }
+            var animated = new HashSet<string>();
+            var toggled = new HashSet<string>();
+            foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
+            {
+                foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type == typeof(GameObject)) toggled.Add(binding.path);
+                    else if (typeof(Renderer).IsAssignableFrom(binding.type) && !binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal)) animated.Add(binding.path);
+                }
+                foreach (EditorCurveBinding binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                    if (typeof(Renderer).IsAssignableFrom(binding.type)) animated.Add(binding.path);
+            }
+            foreach (Renderer renderer in c.avatar.GetComponentsInChildren<Renderer>(true))
+            {
+                if (animated.Contains(Relative(renderer.transform, c))) { locked.Add(renderer); continue; }
+                for (Transform t = renderer.transform; t != null && t != root; t = t.parent)
+                {
+                    bool topLevel = t.parent == root;
+                    if ((!topLevel && toggled.Contains(Relative(t, c))) || (t != renderer.transform && t.GetComponent<Animator>() != null)) { locked.Add(renderer); break; }
+                }
+            }
+            return locked;
+        }
+
+        private static readonly string[] MmdShapes =
+        {
+            "あ", "い", "う", "え", "お", "ん", "まばたき", "笑い", "ウィンク", "ウィンク右", "ウィンク２", "ｳｨﾝｸ２右", "はぅ", "なごみ", "びっくり", "じと目",
+            "なぬ！", "はちゅ目", "瞳小", "真面目", "困る", "にこり", "怒り", "上", "下", "前", "▲", "∧", "ω", "ω□", "はんっ！", "えー", "にやり", "ぺろっ", "てへぺろ",
+            "照れ", "涙", "口角上げ", "口角下げ", "口横広げ", "歯無し上", "歯無し下", "ハイライト消", "映り込み消", "ぐるぐる", "星目", "はぁと", "キリッ", "あ２", "□"
+        };
+
+        // Keep every shape that is animated, named by any component (visemes, VRCFury, gestures),
+        // used for eyelids, or a standard MMD morph; drop the rest from the copy.
+        private static void RemoveUnusedShapesAndBones(Context c, Options options)
+        {
+            var keep = new HashSet<string>();
+            foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
+                foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
+                    if (binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal)) keep.Add(binding.propertyName.Substring("blendShape.".Length));
+            foreach (Component component in c.avatar.GetComponentsInChildren<Component>(true))
+            {
+                if (component == null || component is Transform || component is Renderer) continue;
+                using (var serialized = new SerializedObject(component))
+                {
+                    SerializedProperty property = serialized.GetIterator();
+                    while (property.Next(true))
+                        if (property.propertyType == SerializedPropertyType.String && !string.IsNullOrEmpty(property.stringValue)) keep.Add(property.stringValue);
+                }
+            }
+            if (options.keepMmdShapes) keep.UnionWith(MmdShapes);
+
+            // The descriptor stores eyelid shapes by index: remember names, restore indices afterwards.
+            Component descriptor = c.avatar.GetComponents<Component>().FirstOrDefault(x => x != null && x.GetType().Name == "VRCAvatarDescriptor");
+            SkinnedMeshRenderer eyelids = null;
+            var eyelidNames = new List<string>();
+            if (descriptor != null)
+                using (var serialized = new SerializedObject(descriptor))
+                {
+                    eyelids = serialized.FindProperty("customEyeLookSettings.eyelidsSkinnedMesh")?.objectReferenceValue as SkinnedMeshRenderer;
+                    SerializedProperty indices = serialized.FindProperty("customEyeLookSettings.eyelidsBlendshapes");
+                    if (eyelids != null && eyelids.sharedMesh != null && indices != null && indices.isArray)
+                        for (int i = 0; i < indices.arraySize; i++)
+                        {
+                            int index = indices.GetArrayElementAtIndex(i).intValue;
+                            string name = index >= 0 && index < eyelids.sharedMesh.blendShapeCount ? eyelids.sharedMesh.GetBlendShapeName(index) : null;
+                            eyelidNames.Add(name);
+                            if (name != null) keep.Add(name);
+                        }
+                }
+            int shapes = BSLKClubGeometry.RemoveBlendShapes(c.avatar, keep, mesh => SaveMesh(c, mesh));
+            if (descriptor != null && eyelids != null && eyelidNames.Count > 0)
+                using (var serialized = new SerializedObject(descriptor))
+                {
+                    SerializedProperty indices = serialized.FindProperty("customEyeLookSettings.eyelidsBlendshapes");
+                    for (int i = 0; i < eyelidNames.Count; i++)
+                        indices.GetArrayElementAtIndex(i).intValue = eyelidNames[i] == null ? -1 : eyelids.sharedMesh.GetBlendShapeIndex(eyelidNames[i]);
+                    serialized.ApplyModifiedPropertiesWithoutUndo();
+                }
+            BoneReport bones = BSLKOptimizer.RemoveUnusedBones(c.avatar, mesh => SaveMesh(c, mesh));
+            c.notes.Add("Удалено неиспользуемых blend shapes: " + shapes + "; привязок костей без веса: " + bones.bonesRemoved +
+                (bones.skippedNotReadable > 0 ? "; мешей без Read/Write пропущено: " + bones.skippedNotReadable : "") + ".");
+        }
+
+        private static void StripColliders(Context c, HashSet<string> keys)
+        {
+            if (keys.Count == 0) return;
+            int stripped = 0;
+            foreach (var entry in BSLKClubInsights.PhysBones(c.avatar))
+            {
+                if (!keys.Contains(entry.key)) continue;
+                using (var serialized = new SerializedObject(entry.physBone))
+                {
+                    SerializedProperty colliders = serialized.FindProperty("colliders");
+                    if (colliders == null || !colliders.isArray || colliders.arraySize == 0) continue;
+                    colliders.ClearArray();
+                    serialized.ApplyModifiedPropertiesWithoutUndo();
+                    stripped++;
+                }
+            }
+            c.notes.Add("PhysBone: по вашему выбору отключены коллизии у " + stripped + " цепочек.");
+        }
+
         private static void Remap(Object target, Dictionary<Object, Object> copies)
         {
             using (SerializedObject serialized = new SerializedObject(target))
@@ -307,7 +496,7 @@ namespace BSLK.Optimizer
             return Path.Combine(package.resolvedPath, assetPath.Substring(package.assetPath.Length).TrimStart('/'));
         }
 
-        private static string Relative(Transform transform, Context c)
+        internal static string Relative(Transform transform, Context c)
         {
             return AnimationUtility.CalculateTransformPath(transform, c.avatar.transform);
         }
@@ -338,17 +527,15 @@ namespace BSLK.Optimizer
             {
                 Component component = pending.Dequeue();
                 if (component == null || !visited.Add(component)) continue;
-                if (component.GetType().FullName == "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone")
-                {
-                    using (var serialized = new SerializedObject(component))
-                    {
-                        Transform physicsRoot = serialized.FindProperty("rootTransform")?.objectReferenceValue as Transform;
-                        if (physicsRoot == null) physicsRoot = component.transform;
-                        if (physicsRoot.IsChildOf(c.avatar.transform))
-                            foreach (Transform bone in physicsRoot.GetComponentsInChildren<Transform>(true)) protectedTransforms.Add(bone);
-                    }
-                }
-                foreach (Object reference in References(component))
+                string typeName = component.GetType().FullName;
+                bool physBone = typeName == "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone";
+                if (physBone) ProtectPhysBoneChain(component, c, protectedTransforms);
+                // An ignored transform is excluded from the chain; listing it does not make it necessary.
+                // A VRCFury toggle action aimed at disabled clothing does not make that clothing necessary
+                // either; such actions are removed together with their targets.
+                Func<string, bool> skip = physBone ? (Func<string, bool>)(path => path.StartsWith("ignoreTransforms", StringComparison.Ordinal))
+                    : typeName == "VF.Model.VRCFury" ? path => path.Contains("actions") : (Func<string, bool>)null;
+                foreach (Object reference in References(component, skip))
                 {
                     // GameObject references in clothing toggles do not make that wardrobe necessary.
                     Transform t = (reference as Component)?.transform;
@@ -361,17 +548,52 @@ namespace BSLK.Optimizer
                     }
                 }
             }
-            int removed = 0, preserved = 0;
+            int preserved = 0;
+            var removals = new List<Transform>();
             foreach (Transform t in c.avatar.GetComponentsInChildren<Transform>(true).Reverse())
             {
-                if (t == c.avatar.transform || t == null || t.gameObject.activeInHierarchy) continue;
+                if (t == c.avatar.transform || t.gameObject.activeInHierarchy) continue;
                 if (protectedTransforms.Contains(t)) { preserved++; continue; }
+                removals.Add(t);
+            }
+            // Build-time actions aimed at deleted objects would otherwise be left with missing targets.
+            BSLKClubAnimation.RemoveActionsForDeleted(c, new HashSet<GameObject>(removals.Select(t => t.gameObject)));
+            foreach (Transform t in removals)
+            {
                 c.removedPaths.Add(Relative(t, c));
                 Object.DestroyImmediate(t.gameObject);
-                removed++;
             }
-            c.notes.Add("Удалено выключенных объектов: " + removed + "; сохранено зависимостей: " + preserved + ".");
+            c.notes.Add("Удалено выключенных объектов: " + removals.Count + "; сохранено зависимостей: " + preserved + ".");
             if (preserved > 0) c.notes.Add("Сохранённые выключенные зависимости требуют просмотра: они могут включать служебные объекты или связанные вещи.");
+        }
+
+        // An active PhysBone needs its chain, not every disabled item parented to that chain:
+        // a hair PhysBone rooted at Head must not preserve disabled hats or glasses.
+        private static void ProtectPhysBoneChain(Component physBone, Context c, HashSet<Transform> protectedTransforms)
+        {
+            using (var serialized = new SerializedObject(physBone))
+            {
+                Transform physicsRoot = serialized.FindProperty("rootTransform")?.objectReferenceValue as Transform;
+                if (physicsRoot == null) physicsRoot = physBone.transform;
+                if (!physicsRoot.IsChildOf(c.avatar.transform)) return;
+                var ignored = new HashSet<Transform>();
+                SerializedProperty ignore = serialized.FindProperty("ignoreTransforms");
+                if (ignore != null && ignore.isArray)
+                    for (int i = 0; i < ignore.arraySize; i++)
+                        if (ignore.GetArrayElementAtIndex(i).objectReferenceValue is Transform t) ignored.Add(t);
+                var pending = new Stack<Transform>();
+                pending.Push(physicsRoot);
+                while (pending.Count > 0)
+                {
+                    Transform bone = pending.Pop();
+                    if (ignored.Contains(bone)) continue;
+                    // A disabled subtree with renderers is a wardrobe item, not a bone chain.
+                    if (!bone.gameObject.activeInHierarchy && bone.GetComponentsInChildren<Renderer>(true).Length > 0) continue;
+                    for (Transform t = bone; t != null && t.IsChildOf(c.avatar.transform); t = t.parent)
+                        if (!protectedTransforms.Add(t)) break; // ancestors are always added together
+                    foreach (Transform child in bone) pending.Push(child);
+                }
+            }
         }
 
         private static void FreezeClips(Context c)
@@ -449,7 +671,7 @@ namespace BSLK.Optimizer
         {
             ParticleSystem[] systems = c.avatar.GetComponentsInChildren<ParticleSystem>(true);
             int[] limits = AllocateParticleBudget(systems.Select(s => s.main.maxParticles).ToArray(), ParticleLimit);
-            int changed = 0;
+            int changed = 0, curves = 0;
             for (int i = 0; i < systems.Length; i++)
             {
                 var main = systems[i].main;
@@ -457,11 +679,16 @@ namespace BSLK.Optimizer
                 main.maxParticles = limits[i];
                 changed++;
             }
+            // Unity 2022.3 does not list maxParticles as animatable; a hand-written
+            // "InitialModule.maxNumParticles" binding is dead data and is removed from the copy.
             foreach (AnimationClip clip in c.copies.Values.OfType<AnimationClip>().Distinct())
                 foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
-                    if (binding.type == typeof(ParticleSystem) && binding.propertyName == "maxNumParticles")
+                    if (binding.type == typeof(ParticleSystem) && binding.propertyName.EndsWith("maxNumParticles", StringComparison.Ordinal))
+                    {
                         AnimationUtility.SetEditorCurve(clip, binding, null);
-            c.notes.Add("Ограничено систем частиц: " + changed + ". Общий maxParticles ≤ " + ParticleLimit + ".");
+                        curves++;
+                    }
+            c.notes.Add("Ограничено систем частиц: " + changed + "; удалено анимаций maxParticles: " + curves + ". Общий maxParticles ≤ " + ParticleLimit + ".");
         }
 
         private static void CleanPhysBoneLinks(Context c)
@@ -472,23 +699,31 @@ namespace BSLK.Optimizer
                 if (component == null || component.GetType().FullName != "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone") continue;
                 using (var serialized = new SerializedObject(component))
                 {
-                    SerializedProperty colliders = serialized.FindProperty("colliders");
-                    if (colliders == null || !colliders.isArray) continue;
-                    var seen = new HashSet<Object>();
-                    for (int i = colliders.arraySize - 1; i >= 0; i--)
-                    {
-                        SerializedProperty entry = colliders.GetArrayElementAtIndex(i);
-                        if (entry.propertyType != SerializedPropertyType.ObjectReference) continue;
-                        Object collider = entry.objectReferenceValue;
-                        if (collider != null && seen.Add(collider)) continue;
-                        entry.objectReferenceValue = null;
-                        colliders.DeleteArrayElementAtIndex(i);
-                        removed++;
-                    }
+                    removed += RemoveEmptyAndRepeated(serialized.FindProperty("colliders"));
+                    // Ignored transforms of deleted wardrobe leave missing entries behind.
+                    RemoveEmptyAndRepeated(serialized.FindProperty("ignoreTransforms"));
                     serialized.ApplyModifiedPropertiesWithoutUndo();
                 }
             }
             c.notes.Add("PhysBone: убрано пустых/повторных связей с коллайдерами: " + removed + ". Рабочие столкновения сохранены.");
+        }
+
+        private static int RemoveEmptyAndRepeated(SerializedProperty list)
+        {
+            if (list == null || !list.isArray) return 0;
+            int removed = 0;
+            var seen = new HashSet<Object>();
+            for (int i = list.arraySize - 1; i >= 0; i--)
+            {
+                SerializedProperty entry = list.GetArrayElementAtIndex(i);
+                if (entry.propertyType != SerializedPropertyType.ObjectReference) continue;
+                Object reference = entry.objectReferenceValue;
+                if (reference != null && seen.Add(reference)) continue;
+                entry.objectReferenceValue = null;
+                list.DeleteArrayElementAtIndex(i);
+                removed++;
+            }
+            return removed;
         }
 
         internal static int[] AllocateParticleBudget(int[] counts, int budget)
@@ -508,11 +743,23 @@ namespace BSLK.Optimizer
             return result;
         }
 
+        // Only textures bound to shader texture properties of reachable materials (renderers,
+        // animation swaps, build components). Script/menu icons and stale material slots are
+        // not GPU texture memory of the avatar.
         internal static HashSet<Texture> Textures(GameObject avatar)
         {
             var textures = new HashSet<Texture>();
-            foreach (Object dependency in EditorUtility.CollectDependencies(new Object[] { avatar }))
-                if (dependency is Texture texture) textures.Add(texture);
+            foreach (Material material in EditorUtility.CollectDependencies(new Object[] { avatar }).OfType<Material>())
+            {
+                Shader shader = material.shader;
+                if (shader == null) continue;
+                for (int i = 0; i < shader.GetPropertyCount(); i++)
+                {
+                    if (shader.GetPropertyType(i) != ShaderPropertyType.Texture) continue;
+                    Texture texture = material.GetTexture(shader.GetPropertyNameId(i));
+                    if (texture != null) textures.Add(texture);
+                }
+            }
             return textures;
         }
 
@@ -593,6 +840,158 @@ namespace BSLK.Optimizer
             if (unknownTexture) warnings.Add("Cubemap, RenderTexture или TextureArray не включены в оценку 2D-памяти.");
             foreach (string warning in warnings) report.AppendLine(warning);
             return report.ToString();
+        }
+    }
+}
+
+namespace BSLK.Optimizer
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using System.Text;
+    using UnityEditor;
+    using UnityEngine;
+    using Object = UnityEngine.Object;
+
+    // What occupies each club limit, largest first, with the object to select in the editor.
+    internal static class BSLKClubInsights
+    {
+        internal sealed class Item
+        {
+            public string label;
+            public double value;
+            public Object target;
+        }
+
+        internal sealed class Section
+        {
+            public string title, unit;
+            public double total, limit;
+            public readonly List<Item> items = new List<Item>();
+        }
+
+        internal sealed class PhysBoneEntry
+        {
+            public string key, label;
+            public Component physBone;
+            public int transforms, colliders;
+            public long Checks { get { return (long)transforms * colliders; } }
+        }
+
+        internal static List<Section> Collect(GameObject avatar, int top = 8)
+        {
+            var sections = new List<Section>();
+            if (avatar == null) return sections;
+            Transform root = avatar.transform;
+            Func<Component, string> path = component => component.transform == root ? avatar.name : AnimationUtility.CalculateTransformPath(component.transform, root);
+
+            var triangles = new Section { title = "Треугольники", unit = "", limit = BSLKClubOptimizer.TriangleLimit };
+            var slots = new Section { title = "Material slots", unit = "", limit = BSLKClubOptimizer.SlotLimit };
+            foreach (Renderer renderer in avatar.GetComponentsInChildren<Renderer>(true))
+            {
+                Mesh mesh = renderer is SkinnedMeshRenderer || renderer is MeshRenderer ? BSLKClubGeometry.MeshOf(renderer) : null;
+                if (mesh != null) triangles.items.Add(new Item { label = path(renderer), value = BSLKClubGeometry.TriangleCount(mesh), target = renderer.gameObject });
+                if (renderer.sharedMaterials.Length > 0) slots.items.Add(new Item { label = path(renderer), value = renderer.sharedMaterials.Length, target = renderer.gameObject });
+            }
+            var textures = new Section { title = "Память текстур 2D", unit = " MiB", limit = BSLKClubOptimizer.TextureLimit / 1048576.0 };
+            foreach (Texture2D texture in BSLKClubOptimizer.Textures(avatar).OfType<Texture2D>())
+                textures.items.Add(new Item { label = texture.name + " (" + texture.width + "×" + texture.height + ", " + texture.format + ")", value = BSLKClubTextures.Bytes(texture) / 1048576.0, target = texture });
+            var particles = new Section { title = "Частицы (maxParticles)", unit = "", limit = BSLKClubOptimizer.ParticleLimit };
+            foreach (ParticleSystem system in avatar.GetComponentsInChildren<ParticleSystem>(true))
+                particles.items.Add(new Item { label = path(system), value = system.main.maxParticles, target = system.gameObject });
+            var collisions = new Section { title = "PhysBone-коллизии (оценка: кости × коллайдеры)", unit = "", limit = BSLKClubOptimizer.CollisionLimit };
+            foreach (PhysBoneEntry entry in PhysBones(avatar))
+                if (entry.Checks > 0) collisions.items.Add(new Item { label = entry.label, value = entry.Checks, target = entry.physBone.gameObject });
+
+            foreach (Section section in new[] { triangles, slots, textures, particles, collisions })
+            {
+                section.total = section.items.Sum(i => i.value);
+                List<Item> sorted = section.items.OrderByDescending(i => i.value).Take(top).ToList();
+                section.items.Clear();
+                section.items.AddRange(sorted);
+                sections.Add(section);
+            }
+            return sections;
+        }
+
+        internal static string Format(List<Section> sections)
+        {
+            var text = new StringBuilder();
+            foreach (Section section in sections)
+            {
+                text.AppendLine(section.title + ": " + Number(section.total) + section.unit + " / " + Number(section.limit) + section.unit);
+                foreach (Item item in section.items)
+                    text.AppendLine("  " + Number(item.value) + section.unit + " (" + (section.total > 0 ? (item.value * 100 / section.total).ToString("F0") : "0") + "%) — " + item.label);
+            }
+            return text.ToString();
+        }
+
+        internal static string Number(double value)
+        {
+            return Math.Abs(value - Math.Round(value)) < 1e-9 ? ((long)Math.Round(value)).ToString() : value.ToString("F1");
+        }
+
+        // Estimate per PhysBone: transforms that simulate (ignore list excluded) × assigned colliders.
+        internal static List<PhysBoneEntry> PhysBones(GameObject avatar)
+        {
+            var result = new List<PhysBoneEntry>();
+            Transform root = avatar.transform;
+            foreach (Transform owner in avatar.GetComponentsInChildren<Transform>(true))
+            {
+                Component[] bones = owner.GetComponents<Component>().Where(x => x != null && x.GetType().FullName == "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone").ToArray();
+                for (int i = 0; i < bones.Length; i++)
+                {
+                    string ownerPath = owner == root ? "" : AnimationUtility.CalculateTransformPath(owner, root);
+                    var entry = new PhysBoneEntry { key = ownerPath + "#" + i, label = (ownerPath == "" ? avatar.name : ownerPath) + (bones.Length > 1 ? " #" + (i + 1) : ""), physBone = bones[i] };
+                    using (var serialized = new SerializedObject(bones[i]))
+                    {
+                        Transform chain = serialized.FindProperty("rootTransform")?.objectReferenceValue as Transform;
+                        if (chain == null) chain = owner;
+                        var ignored = new HashSet<Transform>();
+                        SerializedProperty ignore = serialized.FindProperty("ignoreTransforms");
+                        if (ignore != null && ignore.isArray)
+                            for (int k = 0; k < ignore.arraySize; k++)
+                                if (ignore.GetArrayElementAtIndex(k).objectReferenceValue is Transform t) ignored.Add(t);
+                        var pending = new Stack<Transform>();
+                        pending.Push(chain);
+                        while (pending.Count > 0)
+                        {
+                            Transform t = pending.Pop();
+                            // Disabled transforms do not simulate; this matches the SDK count on test avatars.
+                            if (ignored.Contains(t) || !t.gameObject.activeInHierarchy) continue;
+                            entry.transforms++;
+                            foreach (Transform child in t) pending.Push(child);
+                        }
+                        var colliders = new HashSet<Object>();
+                        SerializedProperty list = serialized.FindProperty("colliders");
+                        if (list != null && list.isArray)
+                            for (int k = 0; k < list.arraySize; k++)
+                            {
+                                Object collider = list.GetArrayElementAtIndex(k).objectReferenceValue;
+                                if (collider != null) colliders.Add(collider);
+                            }
+                        entry.colliders = colliders.Count;
+                    }
+                    result.Add(entry);
+                }
+            }
+            return result;
+        }
+
+        // Pick the shortest colliding chains (earrings, tassels, small accessories) first until the
+        // estimate fits the limit. Long chains such as hair or skirts are chosen last.
+        internal static HashSet<string> Suggest(List<PhysBoneEntry> entries, long limit)
+        {
+            var chosen = new HashSet<string>();
+            long total = entries.Sum(e => e.Checks);
+            foreach (PhysBoneEntry entry in entries.Where(e => e.Checks > 0).OrderBy(e => e.transforms).ThenBy(e => e.Checks))
+            {
+                if (total <= limit) break;
+                chosen.Add(entry.key);
+                total -= entry.Checks;
+            }
+            return chosen;
         }
     }
 }

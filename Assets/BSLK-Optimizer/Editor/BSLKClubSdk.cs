@@ -35,6 +35,46 @@ namespace BSLK.Optimizer
             throw new MissingMemberException(instance.GetType().FullName, name);
         }
 
+        // Runs the same preprocess callbacks as an upload (VRCFury, d4rkAvatarOptimizer, Modular
+        // Avatar...) on a temporary clone, like VRCFury's "Build a Test Copy", and analyzes the output.
+        // The clone is always destroyed; the avatar itself is not processed.
+        internal static bool TryAnalyzeBuilt(GameObject avatar, out string report, out string reason)
+        {
+            report = null;
+            reason = "";
+            Type callbacks = FindType("VRC.SDKBase.Editor.BuildPipeline.VRCBuildPipelineCallbacks");
+            MethodInfo preprocess = callbacks?.GetMethod("OnPreprocessAvatar", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(GameObject) }, null);
+            if (preprocess == null)
+            {
+                reason = "VRChat SDK не установлен или эта версия API сборки не поддерживается.";
+                return false;
+            }
+            GameObject clone = UnityEngine.Object.Instantiate(avatar);
+            clone.name = avatar.name + " (проверка сборки)";
+            clone.SetActive(true);
+            try
+            {
+                if (!(bool)preprocess.Invoke(null, new object[] { clone }))
+                {
+                    reason = "Сборка остановлена одним из build-плагинов. Подробности в консоли Unity.";
+                    return false;
+                }
+                // Build plugins have already run, so the "check after build components" hint does not apply.
+                string analysis = string.Join("\n", BSLKClubOptimizer.Analyze(clone).Split('\n').Where(line => !line.StartsWith("Есть сборочные компоненты", StringComparison.Ordinal)));
+                report = analysis + "\nКТО ЗАНИМАЕТ ЛИМИТЫ (ПОСЛЕ СБОРКИ)\n" + BSLKClubInsights.Format(BSLKClubInsights.Collect(clone));
+                return true;
+            }
+            catch (Exception e)
+            {
+                reason = "Сборка завершилась ошибкой: " + (e.InnerException ?? e).Message;
+                return false;
+            }
+            finally
+            {
+                if (clone != null) UnityEngine.Object.DestroyImmediate(clone);
+            }
+        }
+
         internal static bool TryRead(GameObject avatar, out Stats result, out string reason)
         {
             result = null;

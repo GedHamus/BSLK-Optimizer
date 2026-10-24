@@ -716,7 +716,8 @@ namespace BSLK.Optimizer
             return report;
         }
 
-        public static BoneReport RemoveUnusedBones(GameObject avatar)
+        // `save` persists the per-renderer mesh copies; Club mode passes one that writes into the result folder.
+        public static BoneReport RemoveUnusedBones(GameObject avatar, System.Action<Mesh> save = null)
         {
             BoneReport report = new BoneReport();
 
@@ -785,7 +786,7 @@ namespace BSLK.Optimizer
                 // renderer's Transform[] even when both renderers share the same source mesh.
                 mesh = UnityEngine.Object.Instantiate(mesh);
                 mesh.name = renderer.sharedMesh.name + "_Bones";
-                SaveGeneratedMesh(mesh);
+                (save ?? SaveGeneratedMesh)(mesh);
                 Undo.RecordObject(renderer, "BSLK-Optimizer: копия меша для костей");
                 renderer.sharedMesh = mesh;
 
@@ -1477,5 +1478,607 @@ namespace BSLK.Optimizer
         public int bonesRemoved;
         public int skippedNotReadable;
         public int skippedMismatch;
+    }
+}
+
+namespace BSLK.Optimizer
+{
+    using System;
+    using System.Linq;
+    using UnityEngine.Rendering;
+    using Object = UnityEngine.Object;
+
+    // Club-mode geometry on result-owned meshes. Every mesh written here is a new mesh handed to
+    // `save`, which persists it inside the result folder; source assets are never touched.
+    internal static class BSLKClubGeometry
+    {
+        private sealed class Frame
+        {
+            public float weight;
+            public Vector3[] vertices, normals, tangents;
+        }
+
+        // All per-vertex data of a mesh in editable form.
+        private sealed class Parts
+        {
+            public readonly List<Vector3> positions = new List<Vector3>(), normals = new List<Vector3>();
+            public readonly List<Vector4> tangents = new List<Vector4>();
+            public readonly List<Color> colors = new List<Color>();
+            public readonly List<Vector4>[] uvs = Enumerable.Range(0, 8).Select(_ => new List<Vector4>()).ToArray();
+            public readonly int[] uvDimensions = new int[8];
+            public bool hasNormals, hasTangents, hasColors, skinned;
+            public readonly List<byte> bonesPerVertex = new List<byte>();
+            public readonly List<BoneWeight1> weights = new List<BoneWeight1>();
+            public readonly List<Matrix4x4> bindposes = new List<Matrix4x4>();
+            public readonly List<List<int>> submeshes = new List<List<int>>();
+            public readonly List<string> shapeNames = new List<string>();
+            public readonly Dictionary<string, List<Frame>> shapes = new Dictionary<string, List<Frame>>();
+            public int Count { get { return positions.Count; } }
+        }
+
+        internal static bool Editable(Mesh mesh)
+        {
+            if (mesh == null || !mesh.isReadable) return false;
+            for (int i = 0; i < mesh.subMeshCount; i++)
+                if (mesh.GetTopology(i) != MeshTopology.Triangles) return false;
+            return true;
+        }
+
+        private static void Fill<T>(List<T> list, int count, T value)
+        {
+            while (list.Count < count) list.Add(value);
+        }
+
+        private static Parts Read(Mesh mesh)
+        {
+            var p = new Parts();
+            mesh.GetVertices(p.positions);
+            int n = p.Count;
+            mesh.GetNormals(p.normals);
+            p.hasNormals = p.normals.Count == n && n > 0;
+            if (!p.hasNormals) { p.normals.Clear(); Fill(p.normals, n, Vector3.zero); }
+            mesh.GetTangents(p.tangents);
+            p.hasTangents = p.tangents.Count == n && n > 0;
+            if (!p.hasTangents) { p.tangents.Clear(); Fill(p.tangents, n, Vector4.zero); }
+            mesh.GetColors(p.colors);
+            p.hasColors = p.colors.Count == n && n > 0;
+            if (!p.hasColors) { p.colors.Clear(); Fill(p.colors, n, Color.white); }
+            for (int i = 0; i < 8; i++)
+            {
+                var attribute = (VertexAttribute)((int)VertexAttribute.TexCoord0 + i);
+                p.uvDimensions[i] = mesh.HasVertexAttribute(attribute) ? mesh.GetVertexAttributeDimension(attribute) : 0;
+                if (p.uvDimensions[i] > 0) mesh.GetUVs(i, p.uvs[i]);
+                if (p.uvs[i].Count != n) { p.uvs[i].Clear(); Fill(p.uvs[i], n, Vector4.zero); }
+            }
+            var bonesPerVertex = mesh.GetBonesPerVertex();
+            p.skinned = bonesPerVertex.Length == n && n > 0;
+            if (p.skinned)
+            {
+                p.bonesPerVertex.AddRange(bonesPerVertex);
+                p.weights.AddRange(mesh.GetAllBoneWeights());
+            }
+            else Fill(p.bonesPerVertex, n, (byte)0);
+            p.bindposes.AddRange(mesh.bindposes);
+            for (int s = 0; s < mesh.subMeshCount; s++) p.submeshes.Add(new List<int>(mesh.GetIndices(s)));
+            for (int s = 0; s < mesh.blendShapeCount; s++)
+            {
+                string name = mesh.GetBlendShapeName(s);
+                var frames = new List<Frame>();
+                for (int f = 0; f < mesh.GetBlendShapeFrameCount(s); f++)
+                {
+                    var frame = new Frame { weight = mesh.GetBlendShapeFrameWeight(s, f), vertices = new Vector3[n], normals = new Vector3[n], tangents = new Vector3[n] };
+                    mesh.GetBlendShapeFrameVertices(s, f, frame.vertices, frame.normals, frame.tangents);
+                    frames.Add(frame);
+                }
+                p.shapeNames.Add(name);
+                p.shapes[name] = frames;
+            }
+            return p;
+        }
+
+        private static Mesh Write(Parts p, string name)
+        {
+            var mesh = new Mesh { name = name };
+            if (p.Count > 65535) mesh.indexFormat = IndexFormat.UInt32;
+            mesh.SetVertices(p.positions);
+            if (p.hasNormals) mesh.SetNormals(p.normals);
+            if (p.hasTangents) mesh.SetTangents(p.tangents);
+            if (p.hasColors) mesh.SetColors(p.colors);
+            for (int i = 0; i < 8; i++)
+            {
+                if (p.uvDimensions[i] == 2) mesh.SetUVs(i, p.uvs[i].Select(v => (Vector2)v).ToList());
+                else if (p.uvDimensions[i] == 3) mesh.SetUVs(i, p.uvs[i].Select(v => (Vector3)v).ToList());
+                else if (p.uvDimensions[i] == 4) mesh.SetUVs(i, p.uvs[i]);
+            }
+            if (p.skinned)
+            {
+                using (var bonesPerVertex = new NativeArray<byte>(p.bonesPerVertex.ToArray(), Allocator.Temp))
+                using (var weights = new NativeArray<BoneWeight1>(p.weights.ToArray(), Allocator.Temp))
+                    mesh.SetBoneWeights(bonesPerVertex, weights);
+            }
+            if (p.bindposes.Count > 0) mesh.bindposes = p.bindposes.ToArray();
+            mesh.subMeshCount = p.submeshes.Count;
+            for (int s = 0; s < p.submeshes.Count; s++) mesh.SetIndices(p.submeshes[s], MeshTopology.Triangles, s, false);
+            foreach (string shape in p.shapeNames)
+                foreach (Frame frame in p.shapes[shape])
+                    mesh.AddBlendShapeFrame(shape, frame.weight, frame.vertices, frame.normals, frame.tangents);
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        internal static Mesh MeshOf(Renderer renderer)
+        {
+            if (renderer is SkinnedMeshRenderer skinned) return skinned.sharedMesh;
+            MeshFilter filter = renderer.GetComponent<MeshFilter>();
+            return filter != null ? filter.sharedMesh : null;
+        }
+
+        internal static void Assign(Renderer renderer, Mesh mesh)
+        {
+            if (renderer is SkinnedMeshRenderer skinned) skinned.sharedMesh = mesh;
+            else renderer.GetComponent<MeshFilter>().sharedMesh = mesh;
+        }
+
+        private static Transform TopLevel(Transform t, Transform root)
+        {
+            while (t.parent != null && t.parent != root) t = t.parent;
+            return t;
+        }
+
+        // Several SkinnedMeshRenderers of one clothing item become one renderer. Skinning uses
+        // per-bone bind poses, so vertices of different renderers can share one mesh unchanged.
+        // Submeshes with the same material become one slot.
+        internal static int MergeClothing(GameObject avatar, HashSet<Renderer> locked, ICollection<AnimationClip> clips, Func<Mesh, Mesh> save, List<string> notes)
+        {
+            Transform root = avatar.transform;
+            var candidates = avatar.GetComponentsInChildren<SkinnedMeshRenderer>(true).Where(r =>
+                r.gameObject.activeInHierarchy && r.enabled && !locked.Contains(r) && r.transform != root && Editable(r.sharedMesh) &&
+                r.bones.Length > 0 && r.bones.Length == r.sharedMesh.bindposes.Length && r.bones.All(b => b != null) &&
+                r.sharedMesh.GetBonesPerVertex().Length == r.sharedMesh.vertexCount &&
+                r.sharedMaterials.Length == r.sharedMesh.subMeshCount && r.sharedMaterials.All(m => m != null)).ToList();
+            var bindings = new Dictionary<string, List<KeyValuePair<AnimationClip, EditorCurveBinding>>>();
+            foreach (AnimationClip clip in clips)
+                foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
+                    if (binding.type == typeof(SkinnedMeshRenderer) && binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal))
+                    {
+                        if (!bindings.TryGetValue(binding.path, out var list)) bindings[binding.path] = list = new List<KeyValuePair<AnimationClip, EditorCurveBinding>>();
+                        list.Add(new KeyValuePair<AnimationClip, EditorCurveBinding>(clip, binding));
+                    }
+            int merged = 0, slotsBefore = 0, slotsAfter = 0;
+            foreach (var group in candidates.GroupBy(r => new { top = TopLevel(r.transform, root), r.shadowCastingMode, r.receiveShadows, r.quality, r.updateWhenOffscreen, r.skinnedMotionVectors, r.gameObject.layer }))
+            {
+                List<SkinnedMeshRenderer> members = group.OrderByDescending(r => r.sharedMesh.vertexCount).ToList();
+                if (members.Count < 2) continue;
+                if (!TryMerge(members, root, bindings, save, out int before, out int after)) continue;
+                merged += members.Count - 1;
+                slotsBefore += before;
+                slotsAfter += after;
+            }
+            notes.Add("Объединено мешей одежды: " + merged + " (слоты этих вещей: " + slotsBefore + " → " + slotsAfter + ").");
+            return merged;
+        }
+
+        private static bool TryMerge(List<SkinnedMeshRenderer> members, Transform root, Dictionary<string, List<KeyValuePair<AnimationClip, EditorCurveBinding>>> bindings,
+            Func<Mesh, Mesh> save, out int slotsBefore, out int slotsAfter)
+        {
+            slotsBefore = members.Sum(r => r.sharedMaterials.Length);
+            slotsAfter = slotsBefore;
+            SkinnedMeshRenderer target = members[0];
+            var parts = members.Select(r => Read(r.sharedMesh)).ToList();
+            // Different shading inputs cannot be combined without changing the look.
+            if (parts.Any(p => p.hasNormals != parts[0].hasNormals || p.hasTangents != parts[0].hasTangents)) return false;
+            // A shape name shared by several members must have the same frames and the same weight.
+            var shapeWeights = new Dictionary<string, float>();
+            var frameWeights = new Dictionary<string, float[]>();
+            for (int m = 0; m < members.Count; m++)
+                for (int s = 0; s < parts[m].shapeNames.Count; s++)
+                {
+                    string name = parts[m].shapeNames[s];
+                    float weight = members[m].GetBlendShapeWeight(s);
+                    float[] frames = parts[m].shapes[name].Select(f => f.weight).ToArray();
+                    if (shapeWeights.TryGetValue(name, out float existing) &&
+                        (existing != weight || !frameWeights[name].SequenceEqual(frames))) return false;
+                    shapeWeights[name] = weight;
+                    frameWeights[name] = frames;
+                }
+            // Two members animated through the same property in one clip cannot share a renderer.
+            var animated = new HashSet<string>();
+            foreach (SkinnedMeshRenderer member in members)
+            {
+                string path = AnimationUtility.CalculateTransformPath(member.transform, root);
+                if (!bindings.TryGetValue(path, out var list)) continue;
+                foreach (var entry in list)
+                    if (!animated.Add(entry.Key.GetInstanceID() + "/" + entry.Value.propertyName)) return false;
+            }
+
+            var result = new Parts { hasNormals = parts[0].hasNormals, hasTangents = parts[0].hasTangents, hasColors = parts.Any(p => p.hasColors), skinned = true };
+            for (int i = 0; i < 8; i++) result.uvDimensions[i] = parts.Max(p => p.uvDimensions[i]);
+            var bones = new List<Transform>();
+            var materials = new List<Material>();
+            int total = parts.Sum(p => p.Count);
+            foreach (string name in parts.SelectMany(p => p.shapeNames).Distinct())
+            {
+                result.shapeNames.Add(name);
+                result.shapes[name] = frameWeights[name].Select(w => new Frame { weight = w, vertices = new Vector3[total], normals = new Vector3[total], tangents = new Vector3[total] }).ToList();
+            }
+            for (int m = 0; m < members.Count; m++)
+            {
+                Parts p = parts[m];
+                int offset = result.Count;
+                Transform[] memberBones = members[m].bones;
+                var remap = new int[memberBones.Length];
+                for (int b = 0; b < memberBones.Length; b++)
+                {
+                    int index = -1;
+                    for (int k = 0; k < bones.Count; k++)
+                        if (bones[k] == memberBones[b] && result.bindposes[k] == p.bindposes[b]) { index = k; break; }
+                    if (index < 0)
+                    {
+                        index = bones.Count;
+                        bones.Add(memberBones[b]);
+                        result.bindposes.Add(p.bindposes[b]);
+                    }
+                    remap[b] = index;
+                }
+                result.positions.AddRange(p.positions);
+                result.normals.AddRange(p.normals);
+                result.tangents.AddRange(p.tangents);
+                result.colors.AddRange(p.colors);
+                for (int i = 0; i < 8; i++) result.uvs[i].AddRange(p.uvs[i]);
+                result.bonesPerVertex.AddRange(p.bonesPerVertex);
+                foreach (BoneWeight1 weight in p.weights)
+                    result.weights.Add(new BoneWeight1 { boneIndex = remap[weight.boneIndex], weight = weight.weight });
+                Material[] memberMaterials = members[m].sharedMaterials;
+                for (int s = 0; s < p.submeshes.Count; s++)
+                {
+                    int slot = materials.IndexOf(memberMaterials[s]);
+                    if (slot < 0) { slot = materials.Count; materials.Add(memberMaterials[s]); result.submeshes.Add(new List<int>()); }
+                    result.submeshes[slot].AddRange(p.submeshes[s].Select(index => index + offset));
+                }
+                foreach (string name in p.shapeNames)
+                    for (int f = 0; f < p.shapes[name].Count; f++)
+                    {
+                        Frame source = p.shapes[name][f], destination = result.shapes[name][f];
+                        Array.Copy(source.vertices, 0, destination.vertices, offset, p.Count);
+                        Array.Copy(source.normals, 0, destination.normals, offset, p.Count);
+                        Array.Copy(source.tangents, 0, destination.tangents, offset, p.Count);
+                    }
+            }
+
+            // Renderer bounds live in root-bone space; gather all members' world bounds there.
+            Transform space = target.rootBone != null ? target.rootBone : target.transform;
+            Bounds bounds = target.localBounds;
+            foreach (SkinnedMeshRenderer member in members.Skip(1))
+            {
+                Bounds world = member.bounds;
+                for (int corner = 0; corner < 8; corner++)
+                {
+                    Vector3 point = world.center + Vector3.Scale(world.extents, new Vector3((corner & 1) == 0 ? -1 : 1, (corner & 2) == 0 ? -1 : 1, (corner & 4) == 0 ? -1 : 1));
+                    bounds.Encapsulate(space.InverseTransformPoint(point));
+                }
+            }
+
+            Mesh mesh = save(Write(result, target.sharedMesh.name + "_merged"));
+            string targetPath = AnimationUtility.CalculateTransformPath(target.transform, root);
+            foreach (SkinnedMeshRenderer member in members.Skip(1))
+            {
+                string path = AnimationUtility.CalculateTransformPath(member.transform, root);
+                if (bindings.TryGetValue(path, out var list))
+                    foreach (var entry in list)
+                    {
+                        AnimationCurve curve = AnimationUtility.GetEditorCurve(entry.Key, entry.Value);
+                        AnimationUtility.SetEditorCurve(entry.Key, entry.Value, null);
+                        EditorCurveBinding moved = entry.Value;
+                        moved.path = targetPath;
+                        AnimationUtility.SetEditorCurve(entry.Key, moved, curve);
+                    }
+                Object.DestroyImmediate(member);
+            }
+            target.sharedMesh = mesh;
+            target.bones = bones.ToArray();
+            target.sharedMaterials = materials.ToArray();
+            target.localBounds = bounds;
+            for (int s = 0; s < mesh.blendShapeCount; s++) target.SetBlendShapeWeight(s, shapeWeights[mesh.GetBlendShapeName(s)]);
+            slotsAfter = materials.Count;
+            return true;
+        }
+
+        // Several slots of one renderer with the same material become one submesh.
+        internal static int MergeDuplicateSlots(GameObject avatar, HashSet<Renderer> locked, Func<Mesh, Mesh> save)
+        {
+            int removed = 0;
+            foreach (Renderer renderer in avatar.GetComponentsInChildren<Renderer>(true))
+            {
+                if (!(renderer is SkinnedMeshRenderer) && !(renderer is MeshRenderer) || locked.Contains(renderer)) continue;
+                Mesh mesh = MeshOf(renderer);
+                Material[] materials = renderer.sharedMaterials;
+                if (!Editable(mesh) || materials.Length != mesh.subMeshCount || materials.Any(m => m == null)) continue;
+                Material[] distinct = materials.Distinct().ToArray();
+                if (distinct.Length == materials.Length) continue;
+                Parts parts = Read(mesh);
+                var submeshes = distinct.Select(m => new List<int>()).ToList();
+                for (int s = 0; s < materials.Length; s++) submeshes[Array.IndexOf(distinct, materials[s])].AddRange(parts.submeshes[s]);
+                parts.submeshes.Clear();
+                parts.submeshes.AddRange(submeshes);
+                var weights = BlendWeights(renderer as SkinnedMeshRenderer);
+                Assign(renderer, save(Write(parts, mesh.name)));
+                renderer.sharedMaterials = distinct;
+                RestoreBlendWeights(renderer as SkinnedMeshRenderer, weights);
+                removed += materials.Length - distinct.Length;
+            }
+            return removed;
+        }
+
+        private static Dictionary<string, float> BlendWeights(SkinnedMeshRenderer renderer)
+        {
+            var weights = new Dictionary<string, float>();
+            if (renderer == null || renderer.sharedMesh == null) return weights;
+            for (int s = 0; s < renderer.sharedMesh.blendShapeCount; s++) weights[renderer.sharedMesh.GetBlendShapeName(s)] = renderer.GetBlendShapeWeight(s);
+            return weights;
+        }
+
+        private static void RestoreBlendWeights(SkinnedMeshRenderer renderer, Dictionary<string, float> weights)
+        {
+            if (renderer == null || renderer.sharedMesh == null) return;
+            for (int s = 0; s < renderer.sharedMesh.blendShapeCount; s++)
+                if (weights.TryGetValue(renderer.sharedMesh.GetBlendShapeName(s), out float weight)) renderer.SetBlendShapeWeight(s, weight);
+        }
+
+        // Shapes nobody animates, names or holds at a non-zero weight are dropped from the copy.
+        internal static int RemoveBlendShapes(GameObject avatar, HashSet<string> keep, Func<Mesh, Mesh> save)
+        {
+            int removed = 0;
+            foreach (var users in avatar.GetComponentsInChildren<SkinnedMeshRenderer>(true).Where(r => Editable(r.sharedMesh)).GroupBy(r => r.sharedMesh).ToList())
+            {
+                Mesh mesh = users.Key;
+                var drop = new HashSet<string>();
+                for (int s = 0; s < mesh.blendShapeCount; s++)
+                {
+                    string name = mesh.GetBlendShapeName(s);
+                    if (!keep.Contains(name) && users.All(r => r.GetBlendShapeWeight(s) == 0)) drop.Add(name);
+                }
+                if (drop.Count == 0) continue;
+                Parts parts = Read(mesh);
+                parts.shapeNames.RemoveAll(drop.Contains);
+                var weights = users.ToDictionary(r => r, BlendWeights);
+                Mesh result = save(Write(parts, mesh.name));
+                foreach (SkinnedMeshRenderer renderer in users)
+                {
+                    renderer.sharedMesh = result;
+                    RestoreBlendWeights(renderer, weights[renderer]);
+                }
+                removed += drop.Count;
+            }
+            return removed;
+        }
+
+        // ---- Simplification: quadric-error half-edge collapse. A vertex only moves onto an existing
+        // neighbour, so skin weights, UVs and blend shape deltas stay exact. Index-space boundaries
+        // (mesh borders and UV/normal seams) are locked so no cracks open.
+        internal static Mesh Simplify(Mesh source, float ratio, bool lockBlendShapes)
+        {
+            if (!Editable(source)) throw new InvalidOperationException("Меш недоступен для чтения или содержит не только треугольники.");
+            Parts parts = Read(source);
+            int vertexCount = parts.Count;
+            var triangles = new List<int>();
+            var triangleSubmesh = new List<int>();
+            for (int s = 0; s < parts.submeshes.Count; s++)
+                for (int i = 0; i + 2 < parts.submeshes[s].Count; i += 3)
+                {
+                    triangles.Add(parts.submeshes[s][i]); triangles.Add(parts.submeshes[s][i + 1]); triangles.Add(parts.submeshes[s][i + 2]);
+                    triangleSubmesh.Add(s);
+                }
+            int triangleCount = triangleSubmesh.Count;
+            int goal = Math.Max(1, (int)(triangleCount * Mathf.Clamp01(ratio)));
+            var alive = Enumerable.Repeat(true, triangleCount).ToArray();
+            var vertexTriangles = Enumerable.Range(0, vertexCount).Select(_ => new List<int>()).ToArray();
+            for (int t = 0; t < triangleCount; t++)
+                for (int k = 0; k < 3; k++) vertexTriangles[triangles[t * 3 + k]].Add(t);
+
+            var locked = new bool[vertexCount];
+            var edges = new Dictionary<long, int>();
+            for (int t = 0; t < triangleCount; t++)
+                for (int k = 0; k < 3; k++)
+                {
+                    long key = EdgeKey(triangles[t * 3 + k], triangles[t * 3 + (k + 1) % 3]);
+                    edges[key] = edges.TryGetValue(key, out int count) ? count + 1 : 1;
+                }
+            foreach (var edge in edges)
+                if (edge.Value != 2) { locked[(int)(edge.Key >> 32)] = true; locked[(int)(edge.Key & 0xffffffff)] = true; }
+            if (lockBlendShapes)
+                foreach (var frames in parts.shapes.Values)
+                    foreach (Frame frame in frames)
+                        for (int v = 0; v < vertexCount; v++)
+                            if (frame.vertices[v].sqrMagnitude > 1e-12f) locked[v] = true;
+
+            var quadrics = new double[vertexCount * 10];
+            for (int t = 0; t < triangleCount; t++)
+            {
+                Vector3 a = parts.positions[triangles[t * 3]], b = parts.positions[triangles[t * 3 + 1]], c = parts.positions[triangles[t * 3 + 2]];
+                Vector3 normal = Vector3.Cross(b - a, c - a);
+                double area = normal.magnitude;
+                if (area < 1e-20) continue;
+                normal /= (float)area;
+                double d = -Vector3.Dot(normal, a);
+                double[] plane = { normal.x, normal.y, normal.z, d };
+                for (int k = 0; k < 3; k++) AddQuadric(quadrics, triangles[t * 3 + k], plane, area);
+            }
+
+            var version = new int[vertexCount];
+            var dead = new bool[vertexCount];
+            var heap = new Heap();
+            for (int v = 0; v < vertexCount; v++)
+                foreach (int w in Neighbours(v, triangles, vertexTriangles, alive)) Push(heap, v, w, parts, quadrics, locked, version);
+            int remaining = triangleCount;
+            while (remaining > goal && heap.Count > 0)
+            {
+                Heap.Entry entry = heap.Pop();
+                int u = entry.u, v = entry.v;
+                if (dead[u] || dead[v] || version[u] != entry.versionU || version[v] != entry.versionV) continue;
+                if (!CanCollapse(u, v, triangles, vertexTriangles, alive, parts.positions)) continue;
+                foreach (int t in vertexTriangles[u])
+                {
+                    if (!alive[t]) continue;
+                    bool hasV = false;
+                    for (int k = 0; k < 3; k++) hasV |= triangles[t * 3 + k] == v;
+                    if (hasV) { alive[t] = false; remaining--; continue; }
+                    for (int k = 0; k < 3; k++) if (triangles[t * 3 + k] == u) triangles[t * 3 + k] = v;
+                    vertexTriangles[v].Add(t);
+                }
+                vertexTriangles[u].Clear();
+                dead[u] = true;
+                for (int q = 0; q < 10; q++) quadrics[v * 10 + q] += quadrics[u * 10 + q];
+                version[v]++;
+                vertexTriangles[v].RemoveAll(t => !alive[t]);
+                foreach (int w in Neighbours(v, triangles, vertexTriangles, alive))
+                {
+                    Push(heap, v, w, parts, quadrics, locked, version);
+                    Push(heap, w, v, parts, quadrics, locked, version);
+                }
+            }
+
+            // Compact: keep only vertices still referenced, with every attribute and shape.
+            var map = Enumerable.Repeat(-1, vertexCount).ToArray();
+            var order = new List<int>();
+            var submeshes = parts.submeshes.Select(_ => new List<int>()).ToList();
+            for (int t = 0; t < triangleCount; t++)
+            {
+                if (!alive[t]) continue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int old = triangles[t * 3 + k];
+                    if (map[old] < 0) { map[old] = order.Count; order.Add(old); }
+                    submeshes[triangleSubmesh[t]].Add(map[old]);
+                }
+            }
+            var weightStart = new int[vertexCount + 1];
+            for (int v = 0; v < vertexCount; v++) weightStart[v + 1] = weightStart[v] + parts.bonesPerVertex[v];
+            var result = new Parts { hasNormals = parts.hasNormals, hasTangents = parts.hasTangents, hasColors = parts.hasColors, skinned = parts.skinned };
+            Array.Copy(parts.uvDimensions, result.uvDimensions, 8);
+            result.bindposes.AddRange(parts.bindposes);
+            result.submeshes.AddRange(submeshes);
+            foreach (int old in order)
+            {
+                result.positions.Add(parts.positions[old]);
+                result.normals.Add(parts.normals[old]);
+                result.tangents.Add(parts.tangents[old]);
+                result.colors.Add(parts.colors[old]);
+                for (int i = 0; i < 8; i++) result.uvs[i].Add(parts.uvs[i][old]);
+                result.bonesPerVertex.Add(parts.bonesPerVertex[old]);
+                if (parts.skinned) for (int w = weightStart[old]; w < weightStart[old + 1]; w++) result.weights.Add(parts.weights[w]);
+            }
+            foreach (string name in parts.shapeNames)
+            {
+                result.shapeNames.Add(name);
+                result.shapes[name] = parts.shapes[name].Select(frame => new Frame
+                {
+                    weight = frame.weight,
+                    vertices = order.Select(old => frame.vertices[old]).ToArray(),
+                    normals = order.Select(old => frame.normals[old]).ToArray(),
+                    tangents = order.Select(old => frame.tangents[old]).ToArray()
+                }).ToList();
+            }
+            return Write(result, source.name + "_" + Mathf.RoundToInt(ratio * 100) + "pct");
+        }
+
+        internal static int TriangleCount(Mesh mesh)
+        {
+            long count = 0;
+            for (int s = 0; s < mesh.subMeshCount; s++)
+                if (mesh.GetTopology(s) == MeshTopology.Triangles) count += mesh.GetIndexCount(s) / 3;
+            return (int)count;
+        }
+
+        private static long EdgeKey(int a, int b)
+        {
+            return a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+        }
+
+        private static void AddQuadric(double[] q, int vertex, double[] p, double weight)
+        {
+            int o = vertex * 10;
+            q[o] += weight * p[0] * p[0]; q[o + 1] += weight * p[0] * p[1]; q[o + 2] += weight * p[0] * p[2]; q[o + 3] += weight * p[0] * p[3];
+            q[o + 4] += weight * p[1] * p[1]; q[o + 5] += weight * p[1] * p[2]; q[o + 6] += weight * p[1] * p[3];
+            q[o + 7] += weight * p[2] * p[2]; q[o + 8] += weight * p[2] * p[3]; q[o + 9] += weight * p[3] * p[3];
+        }
+
+        private static double Cost(double[] q, int a, int b, Vector3 v)
+        {
+            int i = a * 10, j = b * 10;
+            double x = v.x, y = v.y, z = v.z;
+            double q0 = q[i] + q[j], q1 = q[i + 1] + q[j + 1], q2 = q[i + 2] + q[j + 2], q3 = q[i + 3] + q[j + 3], q4 = q[i + 4] + q[j + 4];
+            double q5 = q[i + 5] + q[j + 5], q6 = q[i + 6] + q[j + 6], q7 = q[i + 7] + q[j + 7], q8 = q[i + 8] + q[j + 8], q9 = q[i + 9] + q[j + 9];
+            return q0 * x * x + 2 * q1 * x * y + 2 * q2 * x * z + 2 * q3 * x + q4 * y * y + 2 * q5 * y * z + 2 * q6 * y + q7 * z * z + 2 * q8 * z + q9;
+        }
+
+        private static void Push(Heap heap, int u, int v, Parts parts, double[] quadrics, bool[] locked, int[] version)
+        {
+            if (locked[u]) return;
+            heap.Push(new Heap.Entry { cost = Cost(quadrics, u, v, parts.positions[v]), u = u, v = v, versionU = version[u], versionV = version[v] });
+        }
+
+        private static HashSet<int> Neighbours(int v, List<int> triangles, List<int>[] vertexTriangles, bool[] alive)
+        {
+            var result = new HashSet<int>();
+            foreach (int t in vertexTriangles[v])
+                if (alive[t])
+                    for (int k = 0; k < 3; k++) if (triangles[t * 3 + k] != v) result.Add(triangles[t * 3 + k]);
+            return result;
+        }
+
+        // Reject collapses that fold a triangle over or pinch the surface into a non-manifold edge.
+        private static bool CanCollapse(int u, int v, List<int> triangles, List<int>[] vertexTriangles, bool[] alive, List<Vector3> positions)
+        {
+            var shared = Neighbours(u, triangles, vertexTriangles, alive);
+            shared.IntersectWith(Neighbours(v, triangles, vertexTriangles, alive));
+            if (shared.Count > 2) return false;
+            foreach (int t in vertexTriangles[u])
+            {
+                if (!alive[t]) continue;
+                int a = triangles[t * 3], b = triangles[t * 3 + 1], c = triangles[t * 3 + 2];
+                if (a == v || b == v || c == v) continue;
+                Vector3 before = Vector3.Cross(positions[b] - positions[a], positions[c] - positions[a]);
+                Vector3 pa = positions[a == u ? v : a], pb = positions[b == u ? v : b], pc = positions[c == u ? v : c];
+                Vector3 after = Vector3.Cross(pb - pa, pc - pa);
+                if (after.sqrMagnitude < 1e-24f || Vector3.Dot(before.normalized, after.normalized) < 0.2f) return false;
+            }
+            return true;
+        }
+
+        private sealed class Heap
+        {
+            internal struct Entry { public double cost; public int u, v, versionU, versionV; }
+            private readonly List<Entry> items = new List<Entry>();
+            public int Count { get { return items.Count; } }
+
+            public void Push(Entry entry)
+            {
+                items.Add(entry);
+                for (int i = items.Count - 1; i > 0;)
+                {
+                    int parent = (i - 1) / 2;
+                    if (items[parent].cost <= items[i].cost) break;
+                    Entry swap = items[parent]; items[parent] = items[i]; items[i] = swap;
+                    i = parent;
+                }
+            }
+
+            public Entry Pop()
+            {
+                Entry top = items[0];
+                items[0] = items[items.Count - 1];
+                items.RemoveAt(items.Count - 1);
+                for (int i = 0; ;)
+                {
+                    int left = i * 2 + 1, right = left + 1, smallest = i;
+                    if (left < items.Count && items[left].cost < items[smallest].cost) smallest = left;
+                    if (right < items.Count && items[right].cost < items[smallest].cost) smallest = right;
+                    if (smallest == i) break;
+                    Entry swap = items[smallest]; items[smallest] = items[i]; items[i] = swap;
+                    i = smallest;
+                }
+                return top;
+            }
+        }
     }
 }
