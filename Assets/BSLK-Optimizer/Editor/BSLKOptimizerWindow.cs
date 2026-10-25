@@ -23,6 +23,7 @@ namespace BSLK.Optimizer
         [SerializeField] private bool keepMmdShapes = true;
         [SerializeField] private bool removeHiddenBody = true;
         [SerializeField] private bool hiddenUnderToggledClothing = true;
+        [SerializeField] private SkinnedMeshRenderer hiddenBody;
         [SerializeField] private List<Texture> protectedTextures = new List<Texture>();
         [SerializeField] private List<string> stripColliders = new List<string>();
         [SerializeField] private string report = "";
@@ -487,9 +488,15 @@ namespace BSLK.Optimizer
                 return;
             }
             GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: в сцене получит новые меши, файлы моделей не меняются)") +
-                ". Убираются треугольники тела, полностью закрытые надетой одеждой в текущей позе. Прозрачная одежда укрытием не считается. Вернуть можно в списке изменённых мешей ниже.", small);
+                ". Убираются только треугольники тела, которые ни с какой стороны не видны сквозь надетую одежду. Сама одежда не режется. Прозрачная одежда, сетка и всё, что на PhysBone (волосы, юбки), укрытием не считаются. Вернуть можно в списке изменённых мешей ниже.", small);
+            if (hiddenBody != null && !hiddenBody.transform.IsChildOf(target.transform)) hiddenBody = null;
+            if (hiddenBody == null) hiddenBody = BSLKClubOcclusion.DetectBodies(target).FirstOrDefault() as SkinnedMeshRenderer;
+            // Only this mesh is cut; clothing is never cut, it only counts as cover.
+            hiddenBody = (SkinnedMeshRenderer)EditorGUILayout.ObjectField("Тело (что вырезать)", hiddenBody, typeof(SkinnedMeshRenderer), true);
+            if (hiddenBody == null) EditorGUILayout.HelpBox("Тело не найдено автоматически: перетащите сюда меш тела аватара.", MessageType.Warning);
             hiddenUnderToggledClothing = EditorGUILayout.ToggleLeft(ToggledCoverLabel, hiddenUnderToggledClothing);
-            if (ColoredButton("Вырезать скрытое тело", Orange)) EditorApplication.delayCall += CutHiddenBody;
+            using (new EditorGUI.DisabledScope(hiddenBody == null))
+                if (ColoredButton("Вырезать скрытое тело", Orange)) EditorApplication.delayCall += CutHiddenBody;
             if (!string.IsNullOrEmpty(hiddenNote)) GUILayout.Label(hiddenNote, wrap);
             EndCard();
         }
@@ -510,7 +517,8 @@ namespace BSLK.Optimizer
             try
             {
                 string folder = target == lastResult ? ResultFolder() : SimplifiedFolder();
-                BSLKClubOcclusion.RemoveHiddenTriangles(target, locked, renderer => hiddenUnderToggledClothing || !toggleable.Contains(renderer), mesh =>
+                if (hiddenBody == null || !hiddenBody.transform.IsChildOf(target.transform)) throw new InvalidOperationException("Выберите меш тела этого аватара.");
+                BSLKClubOcclusion.RemoveHiddenTriangles(target, new List<Renderer> { hiddenBody }, renderer => hiddenUnderToggledClothing || !toggleable.Contains(renderer), mesh =>
                 {
                     AssetDatabase.CreateAsset(mesh, AssetDatabase.GenerateUniqueAssetPath(folder + "/" + mesh.name + "_hidden.asset"));
                     return mesh;

@@ -116,7 +116,8 @@ namespace BSLK.Optimizer
                 HashSet<Renderer> locked = LockedRenderers(context, out HashSet<Renderer> toggleable);
                 // Body under worn clothing is cut only when deleting disabled items was not enough.
                 if (options.removeHiddenBody && TriangleTotal(context.avatar) > TriangleLimit)
-                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, locked, renderer => options.hiddenUnderToggledClothing || !toggleable.Contains(renderer),
+                    BSLKClubOcclusion.RemoveHiddenTriangles(context.avatar, BSLKClubOcclusion.DetectBodies(context.avatar),
+                        renderer => options.hiddenUnderToggledClothing || !toggleable.Contains(renderer),
                         mesh => SaveMesh(context, mesh), context.notes,
                         LiveShapes(context.avatar, context.copies.Values.OfType<AnimationClip>().Distinct(), options.hiddenUnderToggledClothing));
                 if (options.mergeMeshes) BSLKClubGeometry.MergeClothing(context.avatar, locked, ClubClips(context), mesh => SaveMesh(context, mesh), context.notes);

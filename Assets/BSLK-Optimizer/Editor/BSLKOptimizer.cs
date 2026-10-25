@@ -2162,128 +2162,207 @@ namespace BSLK.Optimizer
             public int[] triangles;        // all submeshes flattened, 3 per triangle
             public int[] triangleSubmesh;
             public int[] welded;           // vertex -> position id (UV/normal seams split vertices)
-            public bool[] moved;           // per welded id: some blend shape moves it
-            public bool candidate, toggleable;
+            public bool[] moved;           // per welded id: some live blend shape moves it
+            public bool[] dynamic;         // per triangle: mostly skinned to a PhysBone chain (hair, skirts, tails)
+            public bool candidate, cover;
             public int TriangleCount { get { return triangles.Length / 3; } }
         }
 
-        // Direction table in a local frame where +z is the outward normal: the normal itself and two rings.
-        // 70° from the normal still finds gaps at clothing edges; flatter rays only add grazing noise.
-        private static readonly Vector3[] Directions = MakeDirections();
+        // Viewing directions in a local frame where +z is the outward normal: a dense, even spiral over the
+        // cone a viewer can see a single-sided face from (up to 80° off the normal; flatter is edge-on).
+        // Ordered from the normal outward, so the usual visible case exits on the first rays.
+        private static readonly Vector3[] Directions = MakeDirections(160, 80f);
 
-        private static Vector3[] MakeDirections()
+        private static Vector3[] MakeDirections(int count, float maxAngle)
         {
-            var result = new List<Vector3> { Vector3.forward };
-            float[] angles = { 35f, 70f };
-            for (int ring = 0; ring < angles.Length; ring++)
-                for (int i = 0; i < 8; i++)
+            var result = new Vector3[count];
+            float minZ = Mathf.Cos(maxAngle * Mathf.Deg2Rad), golden = Mathf.PI * (3f - Mathf.Sqrt(5f));
+            for (int i = 0; i < count; i++)
+            {
+                float z = 1f - (1f - minZ) * i / (count - 1), radius = Mathf.Sqrt(Mathf.Max(0f, 1f - z * z)), azimuth = golden * i;
+                result[i] = new Vector3(radius * Mathf.Cos(azimuth), radius * Mathf.Sin(azimuth), z);
+            }
+            return result;
+        }
+
+        // The base body: the viseme mesh when it spans the skeleton, otherwise the skinned mesh weighted to
+        // most core humanoid bones (largest first). Clothing covers only part of the skeleton and is never picked.
+        internal static List<Renderer> DetectBodies(GameObject avatar)
+        {
+            var result = new List<Renderer>();
+            if (avatar == null) return result;
+            Animator animator = avatar.GetComponent<Animator>();
+            var core = new HashSet<Transform>();
+            if (animator != null && animator.isHuman)
+                foreach (HumanBodyBones bone in new[] { HumanBodyBones.Hips, HumanBodyBones.Spine, HumanBodyBones.Chest, HumanBodyBones.LeftUpperLeg, HumanBodyBones.RightUpperLeg,
+                    HumanBodyBones.LeftFoot, HumanBodyBones.RightFoot, HumanBodyBones.LeftHand, HumanBodyBones.RightHand })
                 {
-                    float polar = angles[ring] * Mathf.Deg2Rad, azimuth = (i + ring * 0.5f) * Mathf.PI / 4f;
-                    result.Add(new Vector3(Mathf.Sin(polar) * Mathf.Cos(azimuth), Mathf.Sin(polar) * Mathf.Sin(azimuth), Mathf.Cos(polar)));
+                    Transform t = animator.GetBoneTransform(bone);
+                    if (t != null) core.Add(t);
                 }
-            return result.ToArray();
+            Func<SkinnedMeshRenderer, int> coverage = renderer =>
+            {
+                Mesh mesh = renderer.sharedMesh;
+                if (mesh == null) return 0;
+                Transform[] bones = renderer.bones;
+                var used = new HashSet<int>();
+                var weights = mesh.GetAllBoneWeights();
+                for (int i = 0; i < weights.Length; i++) if (weights[i].weight > 0.3f) used.Add(weights[i].boneIndex);
+                var hits = new HashSet<string>();
+                foreach (int index in used)
+                {
+                    if (index < 0 || index >= bones.Length || bones[index] == null) continue;
+                    if (core.Count > 0) { if (core.Contains(bones[index])) hits.Add(bones[index].name); continue; }
+                    // No humanoid rig: recognise core bone kinds by name.
+                    string name = bones[index].name.ToLowerInvariant();
+                    foreach (string kind in new[] { "hip", "spine", "chest", "thigh|upperleg|upleg|leg", "foot", "hand" })
+                        if (kind.Split('|').Any(name.Contains)) hits.Add(kind);
+                }
+                return hits.Count;
+            };
+            int required = core.Count > 0 ? Math.Max(1, core.Count - 2) : 5;
+            var skinned = avatar.GetComponentsInChildren<SkinnedMeshRenderer>(false).Where(r => r.enabled && r.sharedMesh != null).ToList();
+            Component descriptor = avatar.GetComponents<Component>().FirstOrDefault(x => x != null && x.GetType().Name == "VRCAvatarDescriptor");
+            if (descriptor != null)
+                using (var serialized = new UnityEditor.SerializedObject(descriptor))
+                    if (serialized.FindProperty("VisemeSkinnedMesh")?.objectReferenceValue is SkinnedMeshRenderer face && skinned.Contains(face) && coverage(face) >= required)
+                    {
+                        result.Add(face);
+                        return result;
+                    }
+            SkinnedMeshRenderer best = skinned.Where(r => coverage(r) >= required).OrderByDescending(coverage).ThenByDescending(r => BSLKClubGeometry.TriangleCount(r.sharedMesh)).FirstOrDefault();
+            if (best != null) result.Add(best);
+            return result;
         }
 
         // liveShapes: blend shapes that can change at runtime (animated, named by components, non-zero
         // weight). Unused shapes cannot uncover anything; null treats every shape as live.
-        internal static int RemoveHiddenTriangles(GameObject avatar, HashSet<Renderer> locked, Func<Renderer, bool> occluderAllowed,
+        internal static int RemoveHiddenTriangles(GameObject avatar, ICollection<Renderer> candidates, Func<Renderer, bool> occluderAllowed,
             Func<Mesh, Mesh> save, List<string> notes, ISet<string> liveShapes = null)
         {
             var geometries = new List<Geometry>();
             try
             {
-                Renderer[] renderers = avatar.GetComponentsInChildren<Renderer>(false)
-                    .Where(r => r.enabled && r.gameObject.activeInHierarchy && (r is SkinnedMeshRenderer || r is MeshRenderer)).ToArray();
-                if (renderers.Length < 2)
-                {
-                    notes.Add("Скрытые под одеждой треугольники: нечего удалять (нет подходящих мешей тела и одежды).");
-                    return 0;
-                }
-                Bounds bounds = renderers[0].bounds;
-                foreach (Renderer r in renderers) bounds.Encapsulate(r.bounds);
-                for (int i = 0; i < renderers.Length; i++)
-                {
-                    BSLKClubOptimizer.Progress("Скрытые треугольники: поза " + renderers[i].name, 0.1f * i / renderers.Length);
-                    Renderer renderer = renderers[i];
-                    bool candidate = renderer is SkinnedMeshRenderer && !locked.Contains(renderer);
-                    bool allowed = occluderAllowed(renderer);
-                    Geometry g = Capture(renderer, bounds.center, liveShapes);
-                    if (g == null) continue;
-                    g.candidate = candidate;
-                    // Toggleable renderers stay in the structure only to estimate what they would save.
-                    g.toggleable = !allowed;
-                    geometries.Add(g);
-                }
-                List<Geometry> candidates = geometries.Where(g => g.candidate).ToList();
-                if (candidates.Count == 0 || geometries.Count < 2)
-                {
-                    notes.Add("Скрытые под одеждой треугольники: нечего удалять (нет подходящих мешей тела и одежды).");
-                    return 0;
-                }
-
-                float height = Mathf.Max(bounds.size.y, 0.1f);
-                // Covering clothing is close to the skin: farther hits (another limb, a skirt hem) move with animation.
-                float reach = Mathf.Clamp(height * 0.1f, 0.03f, 0.5f), offset = height * 1e-4f;
-
-                var bvh = new Bvh(geometries);
-                bool[] noCover = bvh.Owners.Select(o => geometries[o].toggleable).ToArray();
-                var tester = new Tester(bvh, reach, offset);
-
-                // Pass 1: only always-visible covers.
-                var hidden = new Dictionary<Geometry, bool[]>();
-                for (int c = 0; c < candidates.Count; c++)
-                    hidden[candidates[c]] = tester.Hidden(candidates[c], geometries.IndexOf(candidates[c]), noCover, null, 0.1f + 0.5f * c / candidates.Count);
-                // Pass 2: a cover may itself be a candidate that loses triangles. Recheck pass-1 results while
-                // ignoring every triangle pass 1 could remove, so each final result relies only on geometry that stays.
-                if (candidates.Count > 1)
-                {
-                    bool[] ignore = (bool[])noCover.Clone();
-                    for (int t = 0; t < ignore.Length; t++)
-                    {
-                        Geometry owner = geometries[bvh.Owners[t]];
-                        if (owner.candidate && hidden[owner][bvh.Local[t]]) ignore[t] = true;
-                    }
-                    for (int c = 0; c < candidates.Count; c++)
-                        hidden[candidates[c]] = tester.Hidden(candidates[c], geometries.IndexOf(candidates[c]), ignore, hidden[candidates[c]], 0.6f + 0.15f * c / candidates.Count);
-                }
-
-                int removed = 0, keptByShapes = 0, potential = 0;
+                Dictionary<Geometry, bool[]> cuts = Run(avatar, candidates, occluderAllowed, liveShapes, geometries, notes);
+                if (cuts == null) return 0;
+                int removed = 0;
                 var changed = new List<string>();
-                for (int c = 0; c < candidates.Count; c++)
+                foreach (var entry in cuts)
                 {
-                    Geometry g = candidates[c];
-                    bool[] cut = Dilate(g, hidden[g], out int shapes);
-                    keptByShapes += shapes;
-                    // Estimate only: what toggleable clothing hides as well (the full test, without the safety ring).
-                    if (noCover.Any(x => x))
-                    {
-                        bool[] withToggles = tester.Hidden(g, geometries.IndexOf(g), null, null, 0.75f + 0.2f * c / candidates.Count, hidden[g]);
-                        for (int t = 0; t < withToggles.Length; t++)
-                            if (withToggles[t] && !hidden[g][t] && !TouchesMoved(g, t)) potential++;
-                    }
-                    int count = cut.Count(x => x);
+                    int count = entry.Value.Count(x => x);
                     if (count == 0) continue;
-                    Apply(g, cut, save);
-                    changed.Add(g.renderer.name + " " + g.TriangleCount + " → " + (g.TriangleCount - count));
+                    Apply(entry.Key, entry.Value, save);
+                    changed.Add(entry.Key.renderer.name + " " + entry.Key.TriangleCount + " → " + (entry.Key.TriangleCount - count));
                     removed += count;
                 }
-                notes.Add("Удалено треугольников тела, полностью закрытых одеждой: " + removed +
-                    (changed.Count > 0 ? " (" + string.Join(", ", changed) + ")" : "") +
-                    ". Оставлены треугольники с шейпкеями: " + keptByShapes +
-                    "; под переключаемой одеждой можно было бы убрать ещё " + potential +
-                    ", но они оставлены, чтобы при её выключении не было дыр.");
+                notes.Add("Удалено треугольников тела, полностью закрытых одеждой: " + removed + (changed.Count > 0 ? " (" + string.Join(", ", changed) + ")" : "") + ".");
                 return removed;
             }
-            finally
+            finally { Release(geometries); }
+        }
+
+        // Same analysis without changing anything: per candidate, the triangles that would be removed.
+        internal static Dictionary<Renderer, bool[]> Analyze(GameObject avatar, ICollection<Renderer> candidates, Func<Renderer, bool> occluderAllowed, ISet<string> liveShapes = null)
+        {
+            var geometries = new List<Geometry>();
+            try
             {
-                foreach (Geometry g in geometries)
-                    if (g.ownsReadable && g.readable != null) Object.DestroyImmediate(g.readable);
+                Dictionary<Geometry, bool[]> cuts = Run(avatar, candidates, occluderAllowed, liveShapes, geometries, new List<string>());
+                return cuts == null ? new Dictionary<Renderer, bool[]>() : cuts.ToDictionary(e => e.Key.renderer, e => e.Value);
             }
+            finally { Release(geometries); }
+        }
+
+        private static void Release(List<Geometry> geometries)
+        {
+            foreach (Geometry g in geometries)
+                if (g.ownsReadable && g.readable != null) Object.DestroyImmediate(g.readable);
+        }
+
+        // A candidate triangle goes only if, from every direction a viewer could see its front from, the line of
+        // sight is blocked by cover: opaque, static clothing of other renderers. The candidate never covers
+        // itself (mouth, armpits, eye sockets stay), distance is unlimited, and two rings around anything
+        // visible stay as a margin.
+        private static Dictionary<Geometry, bool[]> Run(GameObject avatar, ICollection<Renderer> candidates, Func<Renderer, bool> occluderAllowed,
+            ISet<string> liveShapes, List<Geometry> geometries, List<string> notes)
+        {
+            Renderer[] renderers = avatar.GetComponentsInChildren<Renderer>(false)
+                .Where(r => r.enabled && r.gameObject.activeInHierarchy && (r is SkinnedMeshRenderer || r is MeshRenderer)).ToArray();
+            if (candidates == null || !candidates.Any(c => c is SkinnedMeshRenderer && renderers.Contains(c)))
+            {
+                notes.Add("Скрытые под одеждой треугольники: не выбран меш тела.");
+                return null;
+            }
+            Bounds bounds = renderers[0].bounds;
+            foreach (Renderer r in renderers) bounds.Encapsulate(r.bounds);
+            HashSet<Transform> chains = DynamicTransforms(avatar);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                BSLKClubOptimizer.Progress("Скрытые треугольники: поза " + renderers[i].name, 0.1f * i / renderers.Length);
+                Renderer renderer = renderers[i];
+                bool candidate = candidates.Contains(renderer) && renderer is SkinnedMeshRenderer;
+                bool cover = !candidate && occluderAllowed(renderer);
+                if (!candidate && !cover) continue;
+                Geometry g = Capture(renderer, bounds.center, liveShapes, cover ? chains : null);
+                if (g == null) continue;
+                g.candidate = candidate;
+                g.cover = cover;
+                geometries.Add(g);
+            }
+            List<Geometry> bodies = geometries.Where(g => g.candidate).ToList();
+            if (bodies.Count == 0 || !geometries.Any(g => g.cover))
+            {
+                notes.Add("Скрытые под одеждой треугольники: нечего удалять (нет тела или подходящей одежды).");
+                return null;
+            }
+            float offset = Mathf.Max(bounds.size.y, 0.1f) * 1e-4f;
+            var bvh = new Bvh(geometries);
+            var tester = new Tester(bvh, float.MaxValue, offset);
+            var cuts = new Dictionary<Geometry, bool[]>();
+            for (int c = 0; c < bodies.Count; c++)
+            {
+                bool[] hidden = tester.Hidden(bodies[c], geometries.IndexOf(bodies[c]), null, null, 0.1f + 0.85f * c / bodies.Count);
+                cuts[bodies[c]] = Dilate(bodies[c], hidden, 2);
+            }
+            return cuts;
+        }
+
+        // Transforms simulated by active PhysBones (hair, skirts, tails, coat tails): geometry on them moves
+        // away at runtime and cannot be trusted to keep covering the body.
+        private static HashSet<Transform> DynamicTransforms(GameObject avatar)
+        {
+            var result = new HashSet<Transform>();
+            foreach (Component component in avatar.GetComponentsInChildren<Component>(false))
+            {
+                if (component == null || component.GetType().FullName != "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone") continue;
+                if (component is Behaviour behaviour && !behaviour.enabled) continue;
+                using (var serialized = new UnityEditor.SerializedObject(component))
+                {
+                    Transform root = serialized.FindProperty("rootTransform")?.objectReferenceValue as Transform;
+                    if (root == null) root = component.transform;
+                    var ignored = new HashSet<Transform>();
+                    UnityEditor.SerializedProperty list = serialized.FindProperty("ignoreTransforms");
+                    if (list != null && list.isArray)
+                        for (int i = 0; i < list.arraySize; i++)
+                            if (list.GetArrayElementAtIndex(i).objectReferenceValue is Transform t) ignored.Add(t);
+                    var pending = new Stack<Transform>();
+                    // The chain root itself stays put; its descendants swing.
+                    foreach (Transform child in root) pending.Push(child);
+                    while (pending.Count > 0)
+                    {
+                        Transform t = pending.Pop();
+                        if (ignored.Contains(t)) continue;
+                        result.Add(t);
+                        foreach (Transform child in t) pending.Push(child);
+                    }
+                }
+            }
+            return result;
         }
 
         // Positions are kept relative to the avatar centre: an avatar placed far from the origin
         // must not lose float precision in ray tests.
-        private static Geometry Capture(Renderer renderer, Vector3 centre, ISet<string> liveShapes)
+        private static Geometry Capture(Renderer renderer, Vector3 centre, ISet<string> liveShapes, HashSet<Transform> chains)
         {
             Mesh mesh = BSLKClubGeometry.MeshOf(renderer);
             if (mesh == null) return null;
@@ -2332,6 +2411,33 @@ namespace BSLK.Optimizer
                             if (delta[v].sqrMagnitude > 1e-12f) g.moved[g.welded[v]] = true;
                     }
                 }
+            }
+            g.dynamic = new bool[g.TriangleCount];
+            if (chains != null && chains.Count > 0)
+            {
+                var vertexDynamic = new bool[local.Length];
+                var skinnedRenderer = renderer as SkinnedMeshRenderer;
+                if (skinnedRenderer != null && g.readable.GetBonesPerVertex().Length == local.Length)
+                {
+                    Transform[] bones = skinnedRenderer.bones;
+                    var perVertex = g.readable.GetBonesPerVertex();
+                    var weights = g.readable.GetAllBoneWeights();
+                    for (int v = 0, w = 0; v < local.Length; w += perVertex[v], v++)
+                    {
+                        float moving = 0f;
+                        for (int k = w; k < w + perVertex[v]; k++)
+                        {
+                            int bone = weights[k].boneIndex;
+                            if (bone >= 0 && bone < bones.Length && bones[bone] != null && chains.Contains(bones[bone])) moving += weights[k].weight;
+                        }
+                        vertexDynamic[v] = moving > 0.1f;
+                    }
+                }
+                else
+                    for (Transform t = renderer.transform; t != null; t = t.parent)
+                        if (chains.Contains(t)) { for (int v = 0; v < local.Length; v++) vertexDynamic[v] = true; break; }
+                for (int t = 0; t < g.TriangleCount; t++)
+                    g.dynamic[t] = vertexDynamic[g.triangles[t * 3]] || vertexDynamic[g.triangles[t * 3 + 1]] || vertexDynamic[g.triangles[t * 3 + 2]];
             }
             return g;
         }
@@ -2382,25 +2488,24 @@ namespace BSLK.Optimizer
             return g.moved[g.welded[g.triangles[triangle * 3]]] || g.moved[g.welded[g.triangles[triangle * 3 + 1]]] || g.moved[g.welded[g.triangles[triangle * 3 + 2]]];
         }
 
-        // Safety ring: a hidden triangle sharing a position with any kept triangle stays, so sampling misses
-        // and small pose changes at clothing edges do not open cracks.
-        private static bool[] Dilate(Geometry g, bool[] hidden, out int keptByShapes)
+        // Safety rings: hidden triangles within the given number of steps from anything kept stay, so sampling
+        // gaps and small pose changes at clothing edges never open cracks. Triangles moved by live shapes stay.
+        private static bool[] Dilate(Geometry g, bool[] hidden, int rings)
         {
-            keptByShapes = 0;
             int count = g.TriangleCount;
             var keep = new bool[count];
-            var nearKept = new bool[g.moved.Length];
-            for (int t = 0; t < count; t++)
+            for (int t = 0; t < count; t++) keep[t] = !hidden[t] || TouchesMoved(g, t);
+            for (int ring = 0; ring < rings; ring++)
             {
-                keep[t] = !hidden[t] || TouchesMoved(g, t);
-                if (hidden[t] && keep[t]) keptByShapes++;
-                if (keep[t])
-                    for (int k = 0; k < 3; k++) nearKept[g.welded[g.triangles[t * 3 + k]]] = true;
+                var nearKept = new bool[g.moved.Length];
+                for (int t = 0; t < count; t++)
+                    if (keep[t])
+                        for (int k = 0; k < 3; k++) nearKept[g.welded[g.triangles[t * 3 + k]]] = true;
+                for (int t = 0; t < count; t++)
+                    if (!keep[t] && (nearKept[g.welded[g.triangles[t * 3]]] || nearKept[g.welded[g.triangles[t * 3 + 1]]] || nearKept[g.welded[g.triangles[t * 3 + 2]]]))
+                        keep[t] = true;
             }
-            var cut = new bool[count];
-            for (int t = 0; t < count; t++)
-                cut[t] = !keep[t] && !nearKept[g.welded[g.triangles[t * 3]]] && !nearKept[g.welded[g.triangles[t * 3 + 1]]] && !nearKept[g.welded[g.triangles[t * 3 + 2]]];
-            return cut;
+            return keep.Select(k => !k).ToArray();
         }
 
         // Only index buffers change: vertices, weights, bind poses, blend shapes and slots stay as they are.
@@ -2532,13 +2637,14 @@ namespace BSLK.Optimizer
                 for (int o = 0; o < geometries.Count; o++)
                 {
                     Geometry g = geometries[o];
+                    if (!g.cover) continue;
                     Material[] materials = g.renderer.sharedMaterials;
                     for (int t = 0; t < g.TriangleCount; t++)
                     {
                         int s = g.triangleSubmesh[t];
                         // Missing slots do not draw; see-through materials do not hide what is behind them.
                         Material material = s < materials.Length ? materials[s] : null;
-                        if (material == null || SeeThrough(material) || TouchesMoved(g, t)) continue;
+                        if (material == null || SeeThrough(material) || TouchesMoved(g, t) || g.dynamic[t]) continue;
                         Vector3 a = g.positions[g.triangles[t * 3]], b = g.positions[g.triangles[t * 3 + 1]], c = g.positions[g.triangles[t * 3 + 2]];
                         Vector3 e1 = b - a, e2 = c - a, n = Vector3.Cross(e1, e2);
                         if (n.sqrMagnitude < 1e-20f) continue;
@@ -2576,10 +2682,24 @@ namespace BSLK.Optimizer
                 public readonly List<int> first = new List<int>(), count = new List<int>(), left = new List<int>(), right = new List<int>();
             }
 
-            private static bool SeeThrough(Material material)
+            // Cutout, blended and refractive materials let the body show through. Besides the standard queue,
+            // tag and keywords, toon shaders expose their mode as properties (Poiyomi _Mode, lilToon
+            // _TransparentMode and shader variants, UTS _ClippingMode, alpha-to-coverage switches).
+            internal static bool SeeThrough(Material material)
             {
-                return material.renderQueue >= (int)RenderQueue.AlphaTest || material.IsKeywordEnabled("_ALPHATEST_ON") ||
-                    material.IsKeywordEnabled("_ALPHABLEND_ON") || material.IsKeywordEnabled("_ALPHAPREMULTIPLY_ON");
+                if (material.renderQueue >= (int)RenderQueue.AlphaTest) return true;
+                string type = material.GetTag("RenderType", true, "");
+                foreach (string word in new[] { "Transparent", "Cutout", "Fade" })
+                    if (type.IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                foreach (string keyword in material.shaderKeywords)
+                    foreach (string word in new[] { "ALPHATEST", "ALPHABLEND", "ALPHAPREMULTIPLY", "CUTOUT" })
+                        if (keyword.IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                foreach (string property in new[] { "_Mode", "_TransparentMode", "_ClippingMode", "_AlphaToMask", "_AlphaToCoverage", "_TransparentEnabled" })
+                    if (material.HasProperty(property) && material.GetFloat(property) > 0f) return true;
+                string shader = material.shader != null ? material.shader.name : "";
+                foreach (string word in new[] { "cutout", "transparent", "fade", "fur", "gem", "refraction", "glass", "trans" })
+                    if (shader.IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                return false;
             }
 
             private int Build(int start, int length, float[] centres, Nodes nodes)
