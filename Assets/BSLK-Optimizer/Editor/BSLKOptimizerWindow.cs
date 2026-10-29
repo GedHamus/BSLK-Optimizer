@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using UnityEditor;
 using UnityEngine;
 using Object = UnityEngine.Object;
@@ -45,6 +46,7 @@ namespace BSLK.Optimizer
         private List<PlanEntry> autoPlan;
         private string autoPlanNote = "";
         private string hiddenNote = "";
+        private string poiyomiNote = "";
         [SerializeField] private int autoBudget = (int)BSLKClubOptimizer.TriangleLimit;
         [SerializeField] private bool autoProtectFaceHands = true;
         private bool updating;
@@ -285,6 +287,7 @@ namespace BSLK.Optimizer
                     EditorApplication.delayCall += BuildCheck;
             EndCard();
             HiddenBodyTool();
+            PoiyomiTool();
             AutoSimplifyTool();
             SimplifyTool();
         }
@@ -471,6 +474,31 @@ namespace BSLK.Optimizer
             SetMesh(renderer, saved);
             simplified = null;
             return saved;
+        }
+
+        // ---- Poiyomi: realistic lighting, on demand only
+
+        private void PoiyomiTool()
+        {
+            BeginCard("Poiyomi: реалистичный свет", Blue);
+            GameObject target = AutoTarget;
+            if (target == null)
+            {
+                GUILayout.Label("Выберите аватар на вкладке «Создание».", small);
+                EndCard();
+                return;
+            }
+            GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: меняются его материалы)") +
+                ". Снимает блокировку (оптимизированную версию) шейдера Poiyomi, ставит Lighting Type = Realistic в основном проходе и в Add Pass, " +
+                "включает Reflections & Specular. Где Reflections & Specular уже включены, их настройки не трогаются. Отменяется через Undo.", small);
+            if (GUILayout.Button("Настроить Poiyomi на реалистичный свет", GUILayout.Height(26)))
+            {
+                bool source = target != lastResult;
+                if (!source || EditorUtility.DisplayDialog("BSLK Optimizer", "Будут изменены материалы исходного аватара «" + target.name + "» (их можно вернуть через Undo). Продолжить?", "Изменить", "Отмена"))
+                    poiyomiNote = BSLKPoiyomi.MakeRealistic(target);
+            }
+            if (!string.IsNullOrEmpty(poiyomiNote)) GUILayout.Label(poiyomiNote, wrap);
+            EndCard();
         }
 
         // ---- Body under clothing, on demand
@@ -917,6 +945,97 @@ namespace BSLK.Optimizer
                 preview.EndAndDrawPreview(rect);
             }
             GUI.Label(new Rect(rect.x + 8, rect.y + 6, rect.width - 16, 18), label, EditorStyles.whiteBoldLabel);
+        }
+    }
+
+    // Poiyomi Toon materials of an avatar: unlock the optimized shader and switch to realistic lighting.
+    // Poiyomi is optional, so its editor API (Thry ShaderOptimizer) is reached by reflection.
+    internal static class BSLKPoiyomi
+    {
+        private const int RealisticMode = 6;        // _LightingMode KeywordEnum: ..., Flat 5, Realistic 6, Cloth 7, SDF 8
+        private const int AdditiveRealistic = 0;    // _LightingAdditiveType: Realistic 0, Toon 1, Same as Base Pass 3
+        private static readonly string[] ModeKeywords =
+        {
+            "_LIGHTINGMODE_TEXTURERAMP", "_LIGHTINGMODE_MULTILAYER_MATH", "_LIGHTINGMODE_WRAPPED", "_LIGHTINGMODE_SKIN", "_LIGHTINGMODE_SHADEMAP",
+            "_LIGHTINGMODE_FLAT", "_LIGHTINGMODE_REALISTIC", "_LIGHTINGMODE_CLOTH", "_LIGHTINGMODE_SDF"
+        };
+
+        internal static bool IsPoiyomi(Material material)
+        {
+            return material != null && material.shader != null && material.shader.name.IndexOf("poiyomi", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Major version from the shader's "shader_master_label" (e.g. "Poiyomi 9.3.64"); locked copies keep it.
+        internal static int MajorVersion(Material material)
+        {
+            Shader shader = material.shader;
+            int index = shader.FindPropertyIndex("shader_master_label");
+            if (index < 0) return -1;
+            var match = System.Text.RegularExpressions.Regex.Match(shader.GetPropertyDescription(index), @"Poiyomi\D*(\d+)\.(\d+)");
+            return match.Success ? int.Parse(match.Groups[1].Value) : -1;
+        }
+
+        internal static string MakeRealistic(GameObject avatar)
+        {
+            Material[] all = avatar.GetComponentsInChildren<Renderer>(true).SelectMany(r => r.sharedMaterials).Where(IsPoiyomi).Distinct().ToArray();
+            if (all.Length == 0) return "Материалов Poiyomi не найдено.";
+            // The property names and enum values below are those of Poiyomi 9; older versions are left alone.
+            Material[] materials = all.Where(m => MajorVersion(m) >= 9).ToArray();
+            int skipped = all.Length - materials.Length;
+            if (materials.Length == 0) return "Материалов Poiyomi 9 и новее не найдено (старых версий: " + skipped + ", они не тронуты).";
+            Undo.RecordObjects(materials, "Poiyomi: реалистичный свет");
+
+            Type optimizer = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("Thry.ThryEditor.ShaderOptimizer", false) ?? a.GetType("Thry.ShaderOptimizer", false)).FirstOrDefault(t => t != null);
+            MethodInfo isLocked = optimizer?.GetMethod("IsMaterialLocked", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(Material) }, null);
+            MethodInfo unlock = optimizer?.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "UnlockMaterials" && m.GetParameters().Length >= 1 && m.GetParameters()[0].ParameterType == typeof(IEnumerable<Material>));
+            Material[] locked = materials.Where(m => isLocked != null ? (bool)isLocked.Invoke(null, new object[] { m }) : m.shader.name.StartsWith("Hidden/Locked/", StringComparison.Ordinal)).ToArray();
+            int unlocked = 0;
+            if (locked.Length > 0)
+            {
+                if (unlock == null) return "Найдено заблокированных материалов Poiyomi: " + locked.Length + ", но редактор Poiyomi (Thry) не найден. Разблокируйте их в инспекторе Poiyomi и повторите.";
+                object[] args = unlock.GetParameters().Select((p, i) => i == 0 ? (object)locked : p.HasDefaultValue ? p.DefaultValue : Activator.CreateInstance(p.ParameterType)).ToArray();
+                unlock.Invoke(null, args);
+                unlocked = locked.Count(m => isLocked == null || !(bool)isLocked.Invoke(null, new object[] { m }));
+            }
+
+            int lighting = 0, reflections = 0, stillLocked = 0;
+            foreach (Material material in materials)
+            {
+                if (isLocked != null && (bool)isLocked.Invoke(null, new object[] { material })) { stillLocked++; continue; }
+                bool changed = false;
+                if (material.HasProperty("_LightingMode") && (int)material.GetFloat("_LightingMode") != RealisticMode)
+                {
+                    material.SetFloat("_LightingMode", RealisticMode);
+                    foreach (string keyword in ModeKeywords) material.DisableKeyword(keyword);
+                    material.EnableKeyword("_LIGHTINGMODE_REALISTIC");
+                    changed = true;
+                }
+                if (material.HasProperty("_LightingAdditiveType") && (int)material.GetFloat("_LightingAdditiveType") != AdditiveRealistic)
+                {
+                    material.SetFloat("_LightingAdditiveType", AdditiveRealistic);
+                    changed = true;
+                }
+                if (material.HasProperty("_LightingForceColorEnabled") && material.GetFloat("_LightingForceColorEnabled") != 0f)
+                {
+                    material.SetFloat("_LightingForceColorEnabled", 0f);
+                    changed = true;
+                }
+                if (changed) lighting++;
+                // Already enabled reflections keep the author's settings untouched.
+                if (material.HasProperty("_MochieBRDF") && material.GetFloat("_MochieBRDF") == 0f)
+                {
+                    material.SetFloat("_MochieBRDF", 1f);
+                    material.EnableKeyword("MOCHIE_PBR");
+                    reflections++;
+                }
+                EditorUtility.SetDirty(material);
+            }
+            return "Материалов Poiyomi: " + materials.Length + "; разблокировано " + unlocked + "; переведено на Realistic (Force Light Color выключен) " + lighting +
+                "; включены Reflections & Specular у " + reflections + " (у остальных уже были включены — не тронуты)." +
+                (stillLocked > 0 ? " Не удалось разблокировать " + stillLocked + ": разблокируйте вручную и повторите." : "") +
+                (skipped > 0 ? " Материалов Poiyomi старше 9-й версии или без версии: " + skipped + ", они не тронуты." : "") +
+                " Poiyomi снова заблокирует шейдеры сам при загрузке в VRChat.";
         }
     }
 }
