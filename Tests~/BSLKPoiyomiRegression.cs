@@ -35,6 +35,7 @@ public static class BSLKPoiyomiRegression
             plain.SetFloat("_MochieBRDF", 0);
             plain.SetFloat("_LightingForceColorEnabled", 1);
             plain.SetFloat("_LightingMinLightBrightness", 0.4f);
+            plain.SetFloat("_MochieMetallicMultiplier", 0.8f);
             AssetDatabase.CreateAsset(plain, folder + "/Plain.mat");
             var shiny = new Material(shader) { name = "Shiny" };
             shiny.SetFloat("_MochieBRDF", 1);
@@ -74,6 +75,8 @@ public static class BSLKPoiyomiRegression
             Check(plain.GetFloat("_LightingMinLightBrightness") == 0, "Min Brightness set to 0");
             Check(BSLKPoiyomi.MajorVersion(plain) >= 9, "Poiyomi version read from the shader (" + BSLKPoiyomi.MajorVersion(plain) + ")");
             Check(plain.GetFloat("_MochieBRDF") == 1 && plain.IsKeywordEnabled("MOCHIE_PBR"), "Reflections & Specular enabled where it was off");
+            Check(plain.GetFloat("_MochieMetallicMultiplier") == 0 && Mathf.Approximately(plain.GetFloat("_MochieRoughnessMultiplier"), 0.2f),
+                "Newly enabled reflections: Metallic 0, Smoothness 0.2");
             Check(shiny.GetFloat("_MochieBRDF") == 1 && Mathf.Approximately(shiny.GetFloat("_MochieMetallicMultiplier"), 0.37f) &&
                 Mathf.Approximately(shiny.GetFloat("_MochieRoughnessMultiplier"), 0.21f), "Already enabled Reflections & Specular left untouched");
             Check(shiny.GetFloat("_LightingMode") == 7 && shiny.IsKeywordEnabled("_LIGHTINGMODE_CLOTH") && shiny.GetFloat("_LightingAdditiveType") == 0,

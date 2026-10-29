@@ -1032,6 +1032,9 @@ namespace BSLK.Optimizer
                 {
                     material.SetFloat("_MochieBRDF", 1f);
                     material.EnableKeyword("MOCHIE_PBR");
+                    // Fresh reflections start non-metallic and mostly matte instead of Poiyomi's mirror defaults.
+                    if (material.HasProperty("_MochieMetallicMultiplier")) material.SetFloat("_MochieMetallicMultiplier", 0f);
+                    if (material.HasProperty("_MochieRoughnessMultiplier")) material.SetFloat("_MochieRoughnessMultiplier", 0.2f);
                     reflections++;
                 }
                 EditorUtility.SetDirty(material);
