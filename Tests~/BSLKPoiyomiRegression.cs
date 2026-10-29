@@ -34,12 +34,15 @@ public static class BSLKPoiyomiRegression
             plain.SetFloat("_LightingAdditiveType", 3);
             plain.SetFloat("_MochieBRDF", 0);
             plain.SetFloat("_LightingForceColorEnabled", 1);
+            plain.SetFloat("_LightingMinLightBrightness", 0.4f);
             AssetDatabase.CreateAsset(plain, folder + "/Plain.mat");
             var shiny = new Material(shader) { name = "Shiny" };
             shiny.SetFloat("_MochieBRDF", 1);
             shiny.EnableKeyword("MOCHIE_PBR");
             shiny.SetFloat("_MochieMetallicMultiplier", 0.37f);
             shiny.SetFloat("_MochieRoughnessMultiplier", 0.21f);
+            shiny.SetFloat("_LightingMode", 7); // Cloth
+            shiny.EnableKeyword("_LIGHTINGMODE_CLOTH");
             AssetDatabase.CreateAsset(shiny, folder + "/Shiny.mat");
             var other = new Material(Shader.Find("Standard")) { name = "Other" };
             AssetDatabase.CreateAsset(other, folder + "/Other.mat");
@@ -68,11 +71,13 @@ public static class BSLKPoiyomiRegression
             Check(plain.GetFloat("_LightingMode") == 6 && plain.IsKeywordEnabled("_LIGHTINGMODE_REALISTIC") && !plain.IsKeywordEnabled("_LIGHTINGMODE_FLAT"), "Base pass lighting set to Realistic");
             Check(plain.GetFloat("_LightingAdditiveType") == 0, "Add pass lighting set to Realistic");
             Check(plain.GetFloat("_LightingForceColorEnabled") == 0, "Force Light Color switched off");
+            Check(plain.GetFloat("_LightingMinLightBrightness") == 0, "Min Brightness set to 0");
             Check(BSLKPoiyomi.MajorVersion(plain) >= 9, "Poiyomi version read from the shader (" + BSLKPoiyomi.MajorVersion(plain) + ")");
             Check(plain.GetFloat("_MochieBRDF") == 1 && plain.IsKeywordEnabled("MOCHIE_PBR"), "Reflections & Specular enabled where it was off");
             Check(shiny.GetFloat("_MochieBRDF") == 1 && Mathf.Approximately(shiny.GetFloat("_MochieMetallicMultiplier"), 0.37f) &&
                 Mathf.Approximately(shiny.GetFloat("_MochieRoughnessMultiplier"), 0.21f), "Already enabled Reflections & Specular left untouched");
-            Check(shiny.GetFloat("_LightingMode") == 6 && shiny.GetFloat("_LightingAdditiveType") == 0, "Every Poiyomi material gets Realistic");
+            Check(shiny.GetFloat("_LightingMode") == 7 && shiny.IsKeywordEnabled("_LIGHTINGMODE_CLOTH") && shiny.GetFloat("_LightingAdditiveType") == 0,
+                "Cloth lighting type kept, add pass still Realistic");
             Check(other.shader.name == "Standard", "Non-Poiyomi materials untouched");
             Check(note.Contains("разблокировано 1"), "Note reports the unlock");
             Object.DestroyImmediate(root);

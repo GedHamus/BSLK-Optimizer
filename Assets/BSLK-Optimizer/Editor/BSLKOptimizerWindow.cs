@@ -488,9 +488,7 @@ namespace BSLK.Optimizer
                 EndCard();
                 return;
             }
-            GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник: меняются его материалы)") +
-                ". Снимает блокировку (оптимизированную версию) шейдера Poiyomi, ставит Lighting Type = Realistic в основном проходе и в Add Pass, " +
-                "включает Reflections & Specular. Где Reflections & Specular уже включены, их настройки не трогаются. Отменяется через Undo.", small);
+            GUILayout.Label("Аватар: " + target.name + (target == lastResult ? " (клубная копия)" : " (исходник)"), small);
             if (GUILayout.Button("Настроить Poiyomi на реалистичный свет", GUILayout.Height(26)))
             {
                 bool source = target != lastResult;
@@ -952,7 +950,9 @@ namespace BSLK.Optimizer
     // Poiyomi is optional, so its editor API (Thry ShaderOptimizer) is reached by reflection.
     internal static class BSLKPoiyomi
     {
-        private const int RealisticMode = 6;        // _LightingMode KeywordEnum: ..., Flat 5, Realistic 6, Cloth 7, SDF 8
+        private const int RealisticMode = 6;        // _LightingMode KeywordEnum: ..., Skin 3, ..., Flat 5, Realistic 6, Cloth 7, SDF 8
+        // Already physically based types the user chose on purpose: keep them.
+        private static readonly int[] KeptModes = { 3, 6, 7 };
         private const int AdditiveRealistic = 0;    // _LightingAdditiveType: Realistic 0, Toon 1, Same as Base Pass 3
         private static readonly string[] ModeKeywords =
         {
@@ -1004,7 +1004,7 @@ namespace BSLK.Optimizer
             {
                 if (isLocked != null && (bool)isLocked.Invoke(null, new object[] { material })) { stillLocked++; continue; }
                 bool changed = false;
-                if (material.HasProperty("_LightingMode") && (int)material.GetFloat("_LightingMode") != RealisticMode)
+                if (material.HasProperty("_LightingMode") && !KeptModes.Contains((int)material.GetFloat("_LightingMode")))
                 {
                     material.SetFloat("_LightingMode", RealisticMode);
                     foreach (string keyword in ModeKeywords) material.DisableKeyword(keyword);
@@ -1014,6 +1014,11 @@ namespace BSLK.Optimizer
                 if (material.HasProperty("_LightingAdditiveType") && (int)material.GetFloat("_LightingAdditiveType") != AdditiveRealistic)
                 {
                     material.SetFloat("_LightingAdditiveType", AdditiveRealistic);
+                    changed = true;
+                }
+                if (material.HasProperty("_LightingMinLightBrightness") && material.GetFloat("_LightingMinLightBrightness") != 0f)
+                {
+                    material.SetFloat("_LightingMinLightBrightness", 0f);
                     changed = true;
                 }
                 if (material.HasProperty("_LightingForceColorEnabled") && material.GetFloat("_LightingForceColorEnabled") != 0f)
@@ -1031,7 +1036,7 @@ namespace BSLK.Optimizer
                 }
                 EditorUtility.SetDirty(material);
             }
-            return "Материалов Poiyomi: " + materials.Length + "; разблокировано " + unlocked + "; переведено на Realistic (Force Light Color выключен) " + lighting +
+            return "Материалов Poiyomi: " + materials.Length + "; разблокировано " + unlocked + "; изменён свет у " + lighting +
                 "; включены Reflections & Specular у " + reflections + " (у остальных уже были включены — не тронуты)." +
                 (stillLocked > 0 ? " Не удалось разблокировать " + stillLocked + ": разблокируйте вручную и повторите." : "") +
                 (skipped > 0 ? " Материалов Poiyomi старше 9-й версии или без версии: " + skipped + ", они не тронуты." : "") +
